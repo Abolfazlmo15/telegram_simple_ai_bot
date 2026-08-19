@@ -1,0 +1,33 @@
+# Environment variables (NEVER commit these!)
+.env
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# User data and cache (optional - comment out if you want to track these)
+users/
+cache.json
+working_proxies.json
+
+# Logs
+*.log
