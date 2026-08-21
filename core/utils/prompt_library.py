@@ -192,7 +192,7 @@ class PromptLibrary:
                     "communication style and energy level."
                 ),
                 temperature=0.8,
-                max_tokens=800,
+                max_tokens=300,
                 response_format="conversational",
                 tone="friendly_casual",
                 examples=[

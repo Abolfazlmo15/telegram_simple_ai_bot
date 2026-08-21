@@ -22,9 +22,9 @@ class Config:
     RATE_LIMIT_WINDOW_SECONDS = 60
 
     # ==================== CACHE CONFIGURATION ====================
-    CACHE_VERSION = "3.0"
-    CACHE_TTL_SECONDS = 3600
-    CACHE_SIMILARITY_THRESHOLD = 0.85
+    CACHE_VERSION = "3.1"
+    CACHE_TTL_SECONDS = 300          # 5 minutes
+    CACHE_SIMILARITY_THRESHOLD = 0.95
 
     # ==================== LLM CONFIGURATION ====================
     SYSTEM_PROMPT = (
@@ -45,9 +45,14 @@ class Config:
         "qwen/qwen-2.5-7b-instruct:free"
     ]
 
+    # ==================== VISION/IMAGE CONFIGURATION ====================
+    VISION_MAX_IMAGE_SIZE = 1024
+    VISION_IMAGE_QUALITY = 85
+    VISION_ENABLED = True
+
     # ==================== PERFORMANCE SETTINGS ====================
     HTTP_TIMEOUT = 25.0
-    HTTP_MAX_RETRIES = 2
+    HTTP_MAX_RETRIES = 2          # per‑model retries on transient errors
     CONNECTION_POOL_SIZE = 10
 
     # ==================== RESPONSE SETTINGS ====================
@@ -65,9 +70,18 @@ class Config:
     CACHE_FILE = "cache.json"
     MAX_HISTORY_MESSAGES = 10
     MAX_CACHED_CONVERSATIONS = 10
+    IMAGE_MATRIX_DIR = "pictures_data"   # Subfolder for matrix files
 
     # ==================== TELEGRAM MARKDOWN ====================
     TELEGRAM_PARSE_MODE = "Markdown"
+
+    # ==================== CONTEXT ====================
+    MAX_CONTEXT_MESSAGES = 3
+
+    # ==================== PROXY CONFIGURATION ====================
+    PROXY_STORAGE_FILE = "proxies.json"
+    BACKUP_PROXY_TIMEOUT_MINUTES = 5
+    BACKUP_PROXY_MAX_AGE_HOURS = 12
 
     @classmethod
     def validate(cls) -> bool:

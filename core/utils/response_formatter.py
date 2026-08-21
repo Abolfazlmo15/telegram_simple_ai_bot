@@ -1,6 +1,6 @@
 import logging
 from typing import List, Tuple, Optional
-from core.response_config import (
+from core.utils.response_config import (
     ResponseTemplates, FormattingRules,
     MarkdownStyles, EmojiSet
 )
@@ -21,13 +21,6 @@ class ResponseFormatter:
     def format_response(self, text: str, content_type: Optional[str] = None) -> str:
         """
         Main formatting method. Applies appropriate formatting based on content type.
-
-        Args:
-            text: Raw response text
-            content_type: Optional hint about content type
-
-        Returns:
-            Formatted text ready for Telegram
         """
         if not text:
             return ""
@@ -52,14 +45,15 @@ class ResponseFormatter:
             lines = text.split('\n')
             code_lines = []
             text_lines = []
-
             in_code = False
+
             for line in lines:
                 if line.strip().startswith(('def ', 'class ', 'import ', 'from ',
-                                            'function ', 'const ', 'let ', 'var ')):
+                                            'function ', 'const ', 'let ', 'var ',
+                                            'if ', 'else ', 'for ', 'while ')):
                     in_code = True
                     code_lines.append(line)
-                elif in_code and (line.strip() == '' or line.startswith(' ')):
+                elif in_code and (line.strip() == '' or line.startswith(' ') or line.startswith('\t')):
                     code_lines.append(line)
                 else:
                     if code_lines:
@@ -93,7 +87,7 @@ class ResponseFormatter:
         return '\n'.join(formatted_lines)
 
     def _format_text_response(self, text: str) -> str:
-        """Format plain text responses"""
+        """Format plain text responses with basic Markdown"""
         # Add subtle formatting for readability
         paragraphs = text.split('\n\n')
         formatted_paragraphs = []
@@ -107,27 +101,16 @@ class ResponseFormatter:
     def chunk_response(self, text: str) -> List[str]:
         """
         Split response into Telegram-compatible chunks.
-
-        Args:
-            text: Formatted response text
-
-        Returns:
-            List of text chunks, each < 4000 chars
         """
         if not FormattingRules.needs_chunking(text):
             return [text]
-
         return FormattingRules.split_into_chunks(text)
 
     def validate_and_fix(self, text: str) -> Tuple[str, List[str]]:
         """
         Validate Markdown and attempt fixes.
-
-        Returns:
-            Tuple of (fixed_text, list_of_warnings)
         """
         is_valid, errors = FormattingRules.validate_markdown(text)
-
         if is_valid:
             return text, []
 
@@ -136,7 +119,6 @@ class ResponseFormatter:
 
         # Re-validate
         is_valid, remaining_errors = FormattingRules.validate_markdown(fixed_text)
-
         if remaining_errors:
             logger.error(f"Could not fix all Markdown errors: {remaining_errors}")
 
@@ -145,12 +127,6 @@ class ResponseFormatter:
     def prepare_for_sending(self, text: str) -> List[str]:
         """
         Complete preparation pipeline: format, validate, chunk.
-
-        Args:
-            text: Raw response text
-
-        Returns:
-            List of ready-to-send chunks
         """
         # Format
         formatted = self.format_response(text)
@@ -162,7 +138,6 @@ class ResponseFormatter:
 
         # Chunk if needed
         chunks = self.chunk_response(validated)
-
         return chunks
 
     def add_header_footer(self, text: str, header: Optional[str] = None,
