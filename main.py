@@ -7,12 +7,14 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import NetworkError, TimedOut
 from core.config import Config
 from core.engines.base_engine import BaseEngine
+from core.engines.voice_engine import VoiceEngine
 from core.managers.rate_limiter import RateLimiter
 from core.managers.user_data_manager import UserDataManager
 from core.managers.proxy_manager import ProxyManager
 from core.analytics.analytics_engine import AnalyticsEngine
 from handlers.bot_handlers import BotHandlers
 
+# Kill system proxies
 for proxy_var in ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY']:
     if proxy_var in os.environ:
         del os.environ[proxy_var]
@@ -41,6 +43,7 @@ def main() -> None:
 
     logger.info("🚀 Initializing bot components...")
 
+    # ---------- Core Managers ----------
     user_manager = UserDataManager()
     analytics_engine = AnalyticsEngine()
     if Config.ANALYTICS_ENABLED:
@@ -52,19 +55,38 @@ def main() -> None:
         window_seconds=Config.RATE_LIMIT_WINDOW_SECONDS
     )
 
+    # ---------- Base Engine (Text + Vision) ----------
     logger.info("🔄 Initializing Base Engine (Text + Vision)...")
     engine = BaseEngine(user_manager)
     engines_ready = asyncio.run(engine.initialize())
     if not engines_ready:
-        logger.error("❌ Failed to initialize engines. Exiting.")
+        logger.error("❌ Failed to initialize base engines. Exiting.")
         sys.exit(1)
-
     logger.info("✅ Base Engine initialized successfully")
 
+    # ---------- Voice Engine ----------
+    logger.info("🔄 Initializing Voice Engine...")
+    voice_engine = VoiceEngine(user_manager)
+    voice_ready = asyncio.run(voice_engine.initialize())
+    if not voice_ready:
+        logger.warning("⚠️ Voice engine failed to initialize – voice messages will be unavailable")
+    else:
+        logger.info("✅ Voice Engine initialized successfully")
+
+    # ---------- Proxy Manager ----------
     proxy_manager = ProxyManager()
 
-    handlers = BotHandlers(engine, rate_limiter, user_manager, analytics_engine, proxy_manager)
+    # ---------- Handlers ----------
+    handlers = BotHandlers(
+        engine=engine,
+        voice_engine=voice_engine,
+        rate_limiter=rate_limiter,
+        user_data_manager=user_manager,
+        analytics_engine=analytics_engine,
+        proxy_manager=proxy_manager
+    )
 
+    # ---------- Telegram Application ----------
     bot_url = worker_url.rstrip('/') + '/bot'
     logger.info(f"🔗 Using proxy URL: {bot_url}")
 
@@ -80,6 +102,7 @@ def main() -> None:
             .build()
     )
 
+    # ---------- Command Handlers ----------
     logger.info("📋 Registering command handlers...")
     application.add_handler(CommandHandler("start", handlers.start))
     application.add_handler(CommandHandler("help", handlers.help_command))
@@ -89,12 +112,21 @@ def main() -> None:
     application.add_handler(CommandHandler("prioritize_text_engine", handlers.prioritize_text_engine))
     application.add_handler(CommandHandler("prioritize_vision_engine", handlers.prioritize_vision_engine))
 
+    # ---------- Message Handlers ----------
     logger.info("📋 Registering message handlers...")
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
+    # Voice handler – only if voice engine is ready
+    if voice_ready:
+        application.add_handler(MessageHandler(filters.VOICE, handlers.handle_voice))
+        logger.info("✅ Voice handler registered")
+    else:
+        logger.warning("⚠️ Voice handler NOT registered (engine failed)")
 
+    # ---------- Error Handler ----------
     application.add_error_handler(error_handler)
 
+    # ---------- Start Polling ----------
     logger.info("🔄 Starting polling...")
     logger.info("✅ Bot is online and waiting for messages!")
     logger.info(f"⚡ Performance: HTTP/2 enabled (with fallback), 10 connection pool")
@@ -116,6 +148,8 @@ def main() -> None:
         logger.info("🛑 Shutting down...")
         analytics_engine.stop()
         asyncio.run(engine.shutdown())
+        if voice_ready:
+            asyncio.run(voice_engine.shutdown())
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from telegram.ext import ContextTypes
 from telegram.error import NetworkError, TimedOut
 from core.config import Config
 from core.engines.base_engine import BaseEngine
+from core.engines.voice_engine import VoiceEngine
 from core.managers.rate_limiter import RateLimiter
 from core.managers.user_data_manager import UserDataManager
 from core.managers.proxy_manager import ProxyManager
@@ -19,17 +20,18 @@ logger = logging.getLogger(__name__)
 
 
 class BotHandlers:
-    def __init__(self, engine: BaseEngine, rate_limiter: RateLimiter,
-                 user_data_manager: UserDataManager, analytics_engine: AnalyticsEngine,
-                 proxy_manager: ProxyManager):
+    def __init__(self, engine: BaseEngine, voice_engine: VoiceEngine,
+                 rate_limiter: RateLimiter, user_data_manager: UserDataManager,
+                 analytics_engine: AnalyticsEngine, proxy_manager: ProxyManager):
         self.engine = engine
+        self.voice_engine = voice_engine
         self.rate_limiter = rate_limiter
         self.user_data_manager = user_data_manager
         self.analytics_engine = analytics_engine
         self.proxy_manager = proxy_manager
         self.formatter = ResponseFormatter()
 
-    # ---------- COMMAND HANDLERS ----------
+    # ========== COMMAND HANDLERS ==========
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         await self.user_data_manager.start_new_session(user.id, user.username)
@@ -59,8 +61,9 @@ class BotHandlers:
             f"• 📚 Learning & Explanations\n"
             f"• 💼 Business & Professional Advice\n"
             f"• ✨ Creative Writing\n"
-            f"• 🖼️ *Image Analysis* - Just send me a photo!\n\n"
-            f"_Just type your question or send an image and I'll do my best to help!_"
+            f"• 🖼️ *Image Analysis* - Just send me a photo!\n"
+            f"• 🎤 *Voice Messages* - Send me a voice note!\n\n"
+            f"_Just type your question, send an image, or a voice message._"
         )
         await self._send_chunked_message(update, text)
 
@@ -75,10 +78,10 @@ class BotHandlers:
             f"/prioritize_text_engine - Set priority for text models\n"
             f"/prioritize_vision_engine - Set priority for vision models\n\n"
             f"💡 *Tips:*\n"
-            f"\n• Be specific in your questions\n"
-            f"\n• Include context for better answers\n"
-            f"\n• Use code blocks for programming questions\n\n"
-            f"\n\n⌨️ *Markdown Support:*\n"
+            f"• Be specific in your questions\n"
+            f"• Include context for better answers\n"
+            f"• Use code blocks for programming questions\n\n"
+            f"⌨️ *Markdown Support:*\n"
             f"Use `backticks` for code\n"
             f"Use *asterisks* for bold\n"
             f"Use _underscores_ for italic"
@@ -89,16 +92,18 @@ class BotHandlers:
         text = self.formatter.format_response(
             f"🧠 *About This Bot*\n\n"
             f"This is an advanced AI chatbot featuring:\n\n"
-            f"\n• 🚀 *Fast Response Times* - Optimized with HTTP/2\n"
-            f"\n• 💾 *Smart Caching* - Instant answers to common questions\n"
-            f"\n• 📊 *Analytics* - Continuous improvement\n"
-            f"\n• 💬 *Context Awareness* - Remembers conversation history\n"
-            f"\n• 🎯 *Model Priority* - Customize your AI experience\n"
-            f"\n• 🖼️ *Vision Capabilities* - Image analysis and description\n\n"
+            f"• 🚀 *Fast Response Times* - Optimized with HTTP/2\n"
+            f"• 💾 *Smart Caching* - Instant answers to common questions\n"
+            f"• 📊 *Analytics* - Continuous improvement\n"
+            f"• 💬 *Context Awareness* - Remembers conversation history\n"
+            f"• 🎯 *Model Priority* - Customize your AI experience\n"
+            f"• 🖼️ *Vision Capabilities* - Image analysis and description\n"
+            f"• 🎤 *Voice Transcription* - Send a voice note, get a reply\n\n"
             f"*Powered by:*\n"
-            f"\n• DeepSeek, Qwen, and Llama Vision models\n"
-            f"\n• OpenRouter API\n"
-            f"\n• Python & Telegram Bot API\n\n"
+            f"• DeepSeek, Qwen, and Llama Vision models\n"
+            f"• Whisper for speech-to-text\n"
+            f"• OpenRouter API\n"
+            f"• Python & Telegram Bot API\n\n"
             f"Source: [`{Config.BOT_REPO_URL}`]({Config.BOT_REPO_URL})"
         )
         await self._send_chunked_message(update, text)
@@ -146,7 +151,7 @@ class BotHandlers:
                 reply_to_message_id=update.message.message_id
             )
 
-    # ---------- PRIORITY COMMANDS ----------
+    # ========== PRIORITY COMMANDS ==========
     async def prioritize_text_engine(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._start_priority_setup(update, context, engine="text")
 
@@ -284,7 +289,7 @@ class BotHandlers:
             )
             await update.message.reply_text(text, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
-    # ---------- MESSAGE HANDLERS ----------
+    # ========== MESSAGE HANDLERS ==========
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if context.user_data.get('setting_priority'):
             await self.handle_priority_input(update, context)
@@ -311,10 +316,8 @@ class BotHandlers:
         # Check if user is asking about past conversation
         memory_keywords = ["remember", "before", "previous", "past", "earlier", "last time", "what did we", "what did you", "search history"]
         if any(kw in user_text.lower() for kw in memory_keywords):
-            # Try to find relevant history
             history_results = await self.user_data_manager.search_history(user_id, user_text)
             if history_results:
-                # Build a context response
                 context_text = "I found this in our conversation history:\n\n"
                 for entry in history_results[:3]:
                     if entry.get('type') == 'text':
@@ -323,11 +326,13 @@ class BotHandlers:
                     elif entry.get('type') == 'image':
                         context_text += f"• You sent an image with query: {entry.get('query', '')}\n"
                         context_text += f"  Me: {entry.get('response', '')}\n\n"
+                    elif entry.get('type') == 'voice':
+                        context_text += f"• You sent a voice message: {entry.get('transcription', '')}\n"
+                        context_text += f"  Me: {entry.get('response', '')}\n\n"
                 context_text += "Is that what you were looking for?"
                 await update.message.reply_text(context_text, reply_to_message_id=update.message.message_id)
                 return
 
-        # Determine if we should skip cache
         skip_cache = False
         if update.message.reply_to_message:
             skip_cache = True
@@ -458,7 +463,6 @@ class BotHandlers:
             await update.message.reply_text("❌ Failed to download image. Please try again.", reply_to_message_id=update.message.message_id)
             return
 
-        # Save matrix
         matrix_info = None
         try:
             matrix_info = await self.user_data_manager.save_image_matrix(user_id, username, image_bytes)
@@ -501,7 +505,117 @@ class BotHandlers:
             logger.error(f"❌ Vision error: {e}", exc_info=True)
             await placeholder.edit_text(f"❌ *Image analysis failed*\n\n`{str(e)[:200]}`", parse_mode="Markdown")
 
-    # ---------- UTILITY ----------
+    async def handle_voice(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        logger.info("🔊 handle_voice: START")
+        if not self.engine.is_initialized or not self.voice_engine.is_initialized:
+            await update.message.reply_text("⚠️ Bot initializing...", reply_to_message_id=update.message.message_id)
+            return
+
+        user = update.effective_user
+        user_id = user.id
+        username = user.username
+
+        allowed, remaining = await self.rate_limiter.check(user_id)
+        if not allowed:
+            await self._handle_rate_limit(update, remaining)
+            return
+
+        voice = update.message.voice
+        file = await voice.get_file()
+
+        # Get the full file URL
+        full_file_url = file.file_path
+        logger.info(f"🔊 Full file URL: {full_file_url}")
+
+        # Extract relative path after /file/
+        if "/file/" in full_file_url:
+            relative_path = full_file_url.split("/file/", 1)[1]
+        else:
+            relative_path = full_file_url
+
+        # Build proxy URL
+        proxy_base = self.proxy_manager.get_proxy().rstrip('/')
+        proxy_file_url = f"{proxy_base}/file/{relative_path}"
+        logger.info(f"🔊 Proxy file URL: {proxy_file_url}")
+
+        audio_bytes = None
+        proxy_used = None
+        try:
+            timeout = httpx.Timeout(120.0, connect=20.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                for attempt in range(5):
+                    try:
+                        logger.info(f"🔊 Download attempt {attempt + 1}/5 via proxy")
+                        resp = await client.get(proxy_file_url)
+                        resp.raise_for_status()
+                        audio_bytes = resp.content
+                        logger.info(f"📦 Downloaded audio size: {len(audio_bytes)} bytes")
+                        proxy_used = proxy_base
+                        self.proxy_manager.mark_success(proxy_used)
+                        break
+                    except Exception as e:
+                        logger.error(f"Attempt {attempt + 1} failed: {e}")
+                        if attempt == 4:
+                            if proxy_base == self.proxy_manager.primary:
+                                self.proxy_manager.mark_primary_failure()
+                            raise
+                        await asyncio.sleep(2 ** attempt)
+        except Exception as e:
+            logger.error(f"❌ All proxy download attempts failed: {e}")
+            await update.message.reply_text("❌ Failed to download voice message. Please try again.", reply_to_message_id=update.message.message_id)
+            return
+
+        # Save audio file
+        audio_file_path = await self.user_data_manager.save_audio_file(user_id, username, audio_bytes)
+        self.user_data_manager.prune_voices(user_id, username, max_files=5)
+        logger.info(f"🔊 Audio saved to {audio_file_path}")
+
+        placeholder = await update.message.reply_text("🔊", reply_to_message_id=update.message.message_id)
+
+        start_time = time.time()
+        try:
+            transcription, voice_model, tokens_used = await self.voice_engine.transcribe(
+                audio_bytes,
+                context={'user_id': user_id, 'username': username}
+            )
+            logger.info(f"🔊 Transcription: {transcription[:50]}...")
+
+            # Get response using text engine
+            user_data = await self.user_data_manager.load_user_data(user_id, username)
+            history = user_data.get('history', [])
+            response, text_model, text_tokens = await self.engine.text_engine.process(
+                transcription,
+                context={'user_id': user_id, 'username': username, 'history': history, 'skip_cache': True}
+            )
+            response_time = time.time() - start_time
+            total_tokens = tokens_used + text_tokens
+
+            formatted_response = self.formatter.format_response(response)
+            await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
+
+            await self.user_data_manager.add_voice_to_history(
+                user_id=user_id,
+                username=username,
+                transcription=transcription,
+                response=response,
+                audio_file=audio_file_path,
+                response_time=response_time,
+                tokens_used=total_tokens
+            )
+
+            self.analytics_engine.record_message(
+                user_id=user_id,
+                category="voice",
+                response_time=response_time
+            )
+
+            logger.info(f"🔊 Voice handled in {response_time:.2f}s using {voice_model} + {text_model} (tokens: {total_tokens})")
+
+        except Exception as e:
+            logger.error(f"❌ Voice error: {e}", exc_info=True)
+            await placeholder.edit_text(f"❌ *Voice processing failed*\n\n`{str(e)[:200]}`", parse_mode="Markdown")
+
+    # ========== UTILITY ==========
     async def _send_chunked_message(self, update: Update, text: str):
         chunks = self.formatter.prepare_for_sending(text)
         for i, chunk in enumerate(chunks):

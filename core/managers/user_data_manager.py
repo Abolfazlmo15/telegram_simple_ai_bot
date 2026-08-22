@@ -552,3 +552,71 @@ class UserDataManager:
                         break
                 with open(user_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
+    # ---------- VOICE/AUDIO METHODS ----------
+    async def save_audio_file(self, user_id: int, username: Optional[str], audio_bytes: bytes) -> str:
+        """Save the audio file to user's voices directory and return the file path."""
+        user_dir = self._get_user_dir(user_id, username)
+        audio_dir = user_dir / "voices"
+        audio_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = audio_dir / f"{timestamp}.ogg"
+        with open(filename, 'wb') as f:
+            f.write(audio_bytes)
+        return str(filename)
+
+    def prune_voices(self, user_id: int, username: Optional[str], max_files: int = 5):
+        """Delete oldest voice files, keep only the last `max_files`."""
+        user_dir = self._get_user_dir(user_id, username)
+        audio_dir = user_dir / "voices"
+        if audio_dir.exists():
+            files = sorted(audio_dir.glob("*.ogg"), key=lambda p: p.stat().st_mtime, reverse=True)
+            if len(files) > max_files:
+                for f in files[max_files:]:
+                    f.unlink()
+                    logger.info(f"Deleted old voice file: {f}")
+
+    async def add_voice_to_history(self, user_id: int, username: Optional[str],
+                                   transcription: str, response: str,
+                                   audio_file: str,
+                                   response_time: float = 0.0, tokens_used: int = 0):
+        """Add a voice transcription entry to user history."""
+        async with self._lock:
+            user_file = self._get_user_data_file(user_id, username)
+            if user_file.exists():
+                try:
+                    with open(user_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = self._get_default_user_data(user_id, username)
+            else:
+                data = self._get_default_user_data(user_id, username)
+
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "type": "voice",
+                "transcription": transcription,
+                "response": response,
+                "audio_file": audio_file,
+                "response_time": response_time,
+                "tokens_used": tokens_used,
+                "username": username
+            }
+            data['history'].append(entry)
+            if len(data['history']) > Config.MAX_HISTORY_MESSAGES * 2:
+                data['history'] = data['history'][-Config.MAX_HISTORY_MESSAGES * 2:]
+
+            stats = data['stats']
+            stats['total_requests'] = stats.get('total_requests', 0) + 1
+            stats['total_tokens'] = stats.get('total_tokens', 0) + tokens_used
+            total = stats['total_requests']
+            current_avg = stats['avg_response_time']
+            stats['avg_response_time'] = ((current_avg * (total - 1)) + response_time) / total
+
+            with open(user_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            if user_id not in self.recent_conversations:
+                self.recent_conversations[user_id] = []
+            self.recent_conversations[user_id].append(entry)
+            if len(self.recent_conversations[user_id]) > self.max_cached_conversations:
+                self.recent_conversations[user_id] = self.recent_conversations[user_id][-self.max_cached_conversations:]
