@@ -56,34 +56,50 @@ class ModelManager:
                 all_model_ids = [m["id"] for m in data.get("data", []) if m["id"] not in blacklist]
                 logger.info(f"Fetched {len(all_model_ids)} total models from OpenRouter (blacklist applied).")
 
-                # Categorize and prioritize dynamically
-                priority_1 = []  # Uncensored/Compliant (Dolphin, Hermes, OpenChat)
-                priority_2 = []  # High Capability (Qwen, DeepSeek, Llama-3)
-                priority_3 = []  # Any other free models
+                # ============================================================
+                # NEW PRIORITY ORDER:
+                # 1. DeepSeek (top priority)
+                # 2. Qwen (second priority)
+                # 3. Llama (third priority)
+                # 4. Uncensored/Compliant (Dolphin, Hermes, OpenChat)
+                # 5. Any other free models
+                # ============================================================
+                priority_deepseek = []
+                priority_qwen = []
+                priority_llama = []
+                priority_uncensored = []
+                priority_other_free = []
 
                 for model_id in all_model_ids:
                     mid = model_id.lower()
-                    if "dolphin" in mid or "hermes" in mid or "openchat" in mid:
-                        priority_1.append(model_id)
-                    elif "qwen" in mid or "deepseek" in mid or "llama-3" in mid:
-                        priority_2.append(model_id)
+                    if "deepseek" in mid:
+                        priority_deepseek.append(model_id)
+                    elif "qwen" in mid:
+                        priority_qwen.append(model_id)
+                    elif "llama-3" in mid or "llama-4" in mid:
+                        priority_llama.append(model_id)
+                    elif "dolphin" in mid or "hermes" in mid or "openchat" in mid:
+                        priority_uncensored.append(model_id)
                     elif ":free" in mid:
-                        priority_3.append(model_id)
+                        priority_other_free.append(model_id)
 
-                # Combine and remove duplicates while preserving priority order
+                # Combine in priority order, remove duplicates
                 seen = set()
                 dynamic_list = []
-                for model_id in priority_1 + priority_2 + priority_3:
-                    if model_id not in seen:
-                        seen.add(model_id)
-                        dynamic_list.append(model_id)
+                for model_list in [priority_deepseek, priority_qwen, priority_llama,
+                                   priority_uncensored, priority_other_free]:
+                    for model_id in model_list:
+                        if model_id not in seen:
+                            seen.add(model_id)
+                            dynamic_list.append(model_id)
 
                 # Fallback to config defaults if API returns nothing useful
                 if not dynamic_list:
                     dynamic_list = Config.FALLBACK_MODELS
                     logger.warning("Dynamic fetch returned no prioritized models. Using config defaults.")
                 else:
-                    logger.info(f"Dynamic models updated: {len(dynamic_list)} prioritized models ready.")
+                    logger.info(f"Dynamic models updated: {len(dynamic_list)} prioritized models ready. "
+                                f"(DeepSeek: {len(priority_deepseek)}, Qwen: {len(priority_qwen)})")
 
                 with self._lock:
                     self.fast_models = dynamic_list

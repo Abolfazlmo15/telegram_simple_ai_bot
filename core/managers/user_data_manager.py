@@ -7,7 +7,7 @@ import struct
 import zlib
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 from PIL import Image
 import io
 from core.config import Config
@@ -21,8 +21,9 @@ class UserDataManager:
     - User directories named: {user_id}-{username} (auto‑renamed on username change)
     - info.json with user metadata and profile photo path
     - Incremental stats (total_requests, total_images, total_tokens, avg_response_time)
-    - History with text and image entries (matrix file references)
+    - History with text, image, voice entries and generated content
     - Search history by keyword
+    - Preference management via PreferenceManager
     """
 
     def __init__(self, base_dir: str = Config.USER_DATA_DIR, cache_file: str = Config.CACHE_FILE):
@@ -35,23 +36,24 @@ class UserDataManager:
         self.recent_conversations: Dict[int, List[Dict]] = {}
         self.max_cached_conversations = Config.MAX_CACHED_CONVERSATIONS
 
+        # ========== Preference Manager ==========
+        from core.managers.preference_manager import PreferenceManager
+        self.preference_manager = PreferenceManager(self)
+
         logger.info(f"User data manager initialized (dir: {self.base_dir})")
 
     # ---------- USER DIRECTORY & INFO ----------
     def _get_user_dir(self, user_id: int, username: Optional[str]) -> Path:
         """Return the user's directory path, creating it if needed."""
-        # Ensure base directory exists before iterating
         if not self.base_dir.exists():
             self.base_dir.mkdir(parents=True, exist_ok=True)
 
-        # Find existing directory with this user_id
         existing = None
         for d in self.base_dir.iterdir():
             if d.is_dir() and d.name.startswith(f"{user_id}-"):
                 existing = d
                 break
 
-        # If username provided and existing dir doesn't match, rename it
         if username:
             new_name = f"{user_id}-{username}"
             if existing and existing.name != new_name:
@@ -61,7 +63,6 @@ class UserDataManager:
                     logger.info(f"Renamed user dir: {existing.name} -> {new_name}")
                     existing = new_path
                 else:
-                    # New path exists – remove old (shouldn't happen)
                     import shutil
                     shutil.rmtree(existing)
                     existing = new_path
@@ -81,54 +82,100 @@ class UserDataManager:
     def _get_user_data_file(self, user_id: int, username: Optional[str]) -> Path:
         return self._get_user_dir(user_id, username) / "user_data.json"
 
-    async def load_user_info(self, user_id: int, username: Optional[str],
-                             first_name: str = "", last_name: str = "",
-                             bio: str = "", phone_number: str = "") -> dict:
-        """Load or create info.json with user metadata."""
-        async with self._lock:
-            info_file = self._get_user_info_file(user_id, username)
-            if info_file.exists():
-                try:
-                    with open(info_file, 'r', encoding='utf-8') as f:
-                        data = json.load(f)
-                except Exception:
-                    data = {}
-            else:
-                data = {}
+    # ========== PREFERENCE MANAGER METHODS ==========
+    async def get_preferences(self, user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
+        """Get user preferences via PreferenceManager."""
+        return await self.preference_manager.get_preferences(user_id, username)
 
-            # Update with new info
-            data.update({
-                "user_id": user_id,
-                "username": username,
-                "first_name": first_name,
-                "last_name": last_name,
-                "bio": bio,
-                "phone_number": phone_number,
-                "last_updated": datetime.now().isoformat()
-            })
-            with open(info_file, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            return data
+    async def save_preferences(self, user_id: int, username: Optional[str],
+                               preferences: Dict[str, Any]) -> bool:
+        """Save user preferences via PreferenceManager."""
+        return await self.preference_manager.save_preferences(user_id, username, preferences)
 
-    async def save_profile_photo(self, user_id: int, username: Optional[str], photo_bytes: bytes) -> Optional[str]:
-        """Save the user's profile photo to their directory."""
-        try:
-            user_dir = self._get_user_dir(user_id, username)
-            photo_path = user_dir / "profile_photo.jpg"
-            with open(photo_path, 'wb') as f:
-                f.write(photo_bytes)
-            # Update info.json with photo path
-            info_file = user_dir / "info.json"
-            if info_file.exists():
-                with open(info_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                data['profile_photo_path'] = str(photo_path)
-                with open(info_file, 'w', encoding='utf-8') as f:
-                    json.dump(data, f, indent=2, ensure_ascii=False)
-            return str(photo_path)
-        except Exception as e:
-            logger.error(f"Failed to save profile photo for {user_id}: {e}")
-            return None
+    async def get_preference(self, user_id: int, key: str,
+                             username: Optional[str] = None) -> Any:
+        """Get a single preference value."""
+        return await self.preference_manager.get_preference(user_id, key, username)
+
+    async def set_preference(self, user_id: int, key: str, value: Any,
+                             username: Optional[str] = None) -> bool:
+        """Set a single preference value."""
+        return await self.preference_manager.set_preference(user_id, key, value, username)
+
+    async def get_response_mode(self, user_id: int,
+                                username: Optional[str] = None) -> str:
+        """Get user's preferred response mode (text/voice/auto)."""
+        return await self.preference_manager.get_response_mode(user_id, username)
+
+    async def set_response_mode(self, user_id: int, mode: str,
+                                username: Optional[str] = None) -> bool:
+        """Set user's response mode."""
+        return await self.preference_manager.set_response_mode(user_id, mode, username)
+
+    async def get_response_style(self, user_id: int,
+                                 username: Optional[str] = None) -> str:
+        """Get user's preferred response style (concise/detailed/balanced)."""
+        return await self.preference_manager.get_response_style(user_id, username)
+
+    async def set_response_style(self, user_id: int, style: str,
+                                 username: Optional[str] = None) -> bool:
+        """Set user's response style."""
+        return await self.preference_manager.set_response_style(user_id, style, username)
+
+    async def get_preferred_models(self, user_id: int,
+                                   username: Optional[str] = None) -> List[str]:
+        """Get user's preferred models in priority order."""
+        return await self.preference_manager.get_preferred_models(user_id, username)
+
+    async def set_preferred_models(self, user_id: int, models: List[str],
+                                   username: Optional[str] = None) -> bool:
+        """Set user's preferred models."""
+        return await self.preference_manager.set_preferred_models(user_id, models, username)
+
+    async def get_preferred_style(self, user_id: int,
+                                  username: Optional[str] = None) -> str:
+        """Get user's preferred artistic style."""
+        return await self.preference_manager.get_preferred_style(user_id, username)
+
+    async def set_preferred_style(self, user_id: int, style: str,
+                                  username: Optional[str] = None) -> bool:
+        """Set user's preferred artistic style."""
+        return await self.preference_manager.set_preference(user_id, "preferred_style", style, username)
+
+    async def get_custom_instructions(self, user_id: int,
+                                      username: Optional[str] = None) -> str:
+        """Get user's custom instructions."""
+        return await self.preference_manager.get_custom_instructions(user_id, username)
+
+    async def set_custom_instructions(self, user_id: int, instructions: str,
+                                      username: Optional[str] = None) -> bool:
+        """Set user's custom instructions."""
+        return await self.preference_manager.set_preference(user_id, "custom_instructions", instructions, username)
+
+    async def get_voice_speed(self, user_id: int,
+                              username: Optional[str] = None) -> float:
+        """Get user's preferred voice speed."""
+        return await self.preference_manager.get_voice_speed(user_id, username)
+
+    async def set_voice_speed(self, user_id: int, speed: float,
+                              username: Optional[str] = None) -> bool:
+        """Set user's preferred voice speed."""
+        return await self.preference_manager.set_preference(user_id, "voice_speed", speed, username)
+
+    async def get_voice_style(self, user_id: int,
+                              username: Optional[str] = None) -> str:
+        """Get user's preferred voice style."""
+        return await self.preference_manager.get_voice_style(user_id, username)
+
+    async def set_voice_style(self, user_id: int, style: str,
+                              username: Optional[str] = None) -> bool:
+        """Set user's preferred voice style."""
+        return await self.preference_manager.set_preference(user_id, "voice_style", style, username)
+
+    async def is_memory_enabled(self, user_id: int,
+                                username: Optional[str] = None) -> bool:
+        """Check if memory is enabled for the user."""
+        return await self.preference_manager.get_preference(user_id, "memory_enabled", username) or True
 
     # ---------- USER DATA & HISTORY ----------
     def _get_default_user_data(self, user_id: int, username: Optional[str] = None) -> dict:
@@ -154,6 +201,53 @@ class UserDataManager:
             },
             "sessions": []
         }
+
+    async def load_user_info(self, user_id: int, username: Optional[str],
+                             first_name: str = "", last_name: str = "",
+                             bio: str = "", phone_number: str = "") -> dict:
+        """Load or create info.json with user metadata."""
+        async with self._lock:
+            info_file = self._get_user_info_file(user_id, username)
+            if info_file.exists():
+                try:
+                    with open(info_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {}
+            else:
+                data = {}
+
+            data.update({
+                "user_id": user_id,
+                "username": username,
+                "first_name": first_name,
+                "last_name": last_name,
+                "bio": bio,
+                "phone_number": phone_number,
+                "last_updated": datetime.now().isoformat()
+            })
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            return data
+
+    async def save_profile_photo(self, user_id: int, username: Optional[str], photo_bytes: bytes) -> Optional[str]:
+        """Save the user's profile photo to their directory."""
+        try:
+            user_dir = self._get_user_dir(user_id, username)
+            photo_path = user_dir / "profile_photo.jpg"
+            with open(photo_path, 'wb') as f:
+                f.write(photo_bytes)
+            info_file = user_dir / "info.json"
+            if info_file.exists():
+                with open(info_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                data['profile_photo_path'] = str(photo_path)
+                with open(info_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+            return str(photo_path)
+        except Exception as e:
+            logger.error(f"Failed to save profile photo for {user_id}: {e}")
+            return None
 
     async def load_user_data(self, user_id: int, username: Optional[str] = None) -> dict:
         async with self._lock:
@@ -208,7 +302,6 @@ class UserDataManager:
             if len(data['history']) > Config.MAX_HISTORY_MESSAGES * 2:
                 data['history'] = data['history'][-Config.MAX_HISTORY_MESSAGES * 2:]
 
-            # Update stats incrementally
             stats = data['stats']
             stats['total_requests'] = stats.get('total_requests', 0) + 1
             stats['total_tokens'] = stats.get('total_tokens', 0) + tokens_used
@@ -219,7 +312,6 @@ class UserDataManager:
             with open(user_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
 
-            # Update cache
             if user_id not in self.recent_conversations:
                 self.recent_conversations[user_id] = []
             self.recent_conversations[user_id].append(entry)
@@ -274,6 +366,104 @@ class UserDataManager:
             if len(self.recent_conversations[user_id]) > self.max_cached_conversations:
                 self.recent_conversations[user_id] = self.recent_conversations[user_id][-self.max_cached_conversations:]
 
+    # ---------- GENERATION HISTORY ----------
+    async def add_generated_image_to_history(self, user_id: int, username: Optional[str],
+                                             prompt: str, response: str,
+                                             matrix_file: str, width: int, height: int,
+                                             model_used: str, response_time: float, tokens_used: int):
+        """Add a generated image entry to user history."""
+        async with self._lock:
+            user_file = self._get_user_data_file(user_id, username)
+            if user_file.exists():
+                try:
+                    with open(user_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = self._get_default_user_data(user_id, username)
+            else:
+                data = self._get_default_user_data(user_id, username)
+
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "type": "generated_image",
+                "prompt": prompt,
+                "response": response,
+                "matrix_file": matrix_file,
+                "width": width,
+                "height": height,
+                "model_used": model_used,
+                "response_time": response_time,
+                "tokens_used": tokens_used,
+                "username": username
+            }
+            data['history'].append(entry)
+            if len(data['history']) > Config.MAX_HISTORY_MESSAGES * 2:
+                data['history'] = data['history'][-Config.MAX_HISTORY_MESSAGES * 2:]
+
+            stats = data['stats']
+            stats['total_requests'] = stats.get('total_requests', 0) + 1
+            stats['total_images'] = stats.get('total_images', 0) + 1
+            stats['total_tokens'] = stats.get('total_tokens', 0) + tokens_used
+            total = stats['total_requests']
+            current_avg = stats['avg_response_time']
+            stats['avg_response_time'] = ((current_avg * (total - 1)) + response_time) / total
+
+            with open(user_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            if user_id not in self.recent_conversations:
+                self.recent_conversations[user_id] = []
+            self.recent_conversations[user_id].append(entry)
+            if len(self.recent_conversations[user_id]) > self.max_cached_conversations:
+                self.recent_conversations[user_id] = self.recent_conversations[user_id][-self.max_cached_conversations:]
+
+    async def add_generated_voice_to_history(self, user_id: int, username: Optional[str],
+                                             prompt: str, response: str,
+                                             audio_file: str, model_used: str,
+                                             response_time: float, tokens_used: int):
+        """Add a generated voice entry to user history."""
+        async with self._lock:
+            user_file = self._get_user_data_file(user_id, username)
+            if user_file.exists():
+                try:
+                    with open(user_file, 'r', encoding='utf-8') as f:
+                        data = json.load(f)
+                except Exception:
+                    data = self._get_default_user_data(user_id, username)
+            else:
+                data = self._get_default_user_data(user_id, username)
+
+            entry = {
+                "timestamp": datetime.now().isoformat(),
+                "type": "generated_voice",
+                "prompt": prompt,
+                "response": response,
+                "audio_file": audio_file,
+                "model_used": model_used,
+                "response_time": response_time,
+                "tokens_used": tokens_used,
+                "username": username
+            }
+            data['history'].append(entry)
+            if len(data['history']) > Config.MAX_HISTORY_MESSAGES * 2:
+                data['history'] = data['history'][-Config.MAX_HISTORY_MESSAGES * 2:]
+
+            stats = data['stats']
+            stats['total_requests'] = stats.get('total_requests', 0) + 1
+            stats['total_tokens'] = stats.get('total_tokens', 0) + tokens_used
+            total = stats['total_requests']
+            current_avg = stats['avg_response_time']
+            stats['avg_response_time'] = ((current_avg * (total - 1)) + response_time) / total
+
+            with open(user_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+
+            if user_id not in self.recent_conversations:
+                self.recent_conversations[user_id] = []
+            self.recent_conversations[user_id].append(entry)
+            if len(self.recent_conversations[user_id]) > self.max_cached_conversations:
+                self.recent_conversations[user_id] = self.recent_conversations[user_id][-self.max_cached_conversations:]
+
     # ---------- SEARCH HISTORY ----------
     async def search_history(self, user_id: int, query: str, limit: int = 5) -> List[Dict]:
         """Search user's history for entries containing the query (case‑insensitive)."""
@@ -281,8 +471,8 @@ class UserDataManager:
         history = user_data.get('history', [])
         results = []
         query_lower = query.lower()
-        for entry in reversed(history):  # newest first
-            text = entry.get('message', '') + ' ' + entry.get('query', '')
+        for entry in reversed(history):
+            text = entry.get('message', '') + ' ' + entry.get('query', '') + ' ' + entry.get('prompt', '')
             if query_lower in text.lower():
                 results.append(entry)
                 if len(results) >= limit:
@@ -502,7 +692,7 @@ class UserDataManager:
                 logger.info(f"Cleared data for user {user_id}")
                 return True
         except Exception as e:
-            logger.error(f"Failed to clear data for {user_id}: {e}")
+            logger.error(f"Failed to clear data for user {user_id}: {e}")
         return False
 
     # ---------- SESSIONS ----------
@@ -546,12 +736,13 @@ class UserDataManager:
                     if session.get('end_time') is None:
                         session['end_time'] = datetime.now().isoformat()
                         session['duration_minutes'] = (
-                                                              datetime.fromisoformat(session['end_time']) -
-                                                              datetime.fromisoformat(session['start_time'])
-                                                      ).total_seconds() / 60
+                            datetime.fromisoformat(session['end_time']) -
+                            datetime.fromisoformat(session['start_time'])
+                        ).total_seconds() / 60
                         break
                 with open(user_file, 'w', encoding='utf-8') as f:
                     json.dump(data, f, indent=2, ensure_ascii=False)
+
     # ---------- VOICE/AUDIO METHODS ----------
     async def save_audio_file(self, user_id: int, username: Optional[str], audio_bytes: bytes) -> str:
         """Save the audio file to user's voices directory and return the file path."""
@@ -620,3 +811,82 @@ class UserDataManager:
             self.recent_conversations[user_id].append(entry)
             if len(self.recent_conversations[user_id]) > self.max_cached_conversations:
                 self.recent_conversations[user_id] = self.recent_conversations[user_id][-self.max_cached_conversations:]
+
+    # ---------- IMAGE GENERATION PRIORITY ----------
+    async def get_image_generation_priority(self, user_id: int, username: Optional[str] = None) -> List[str]:
+        """
+        Get the user's preferred image generation tier priority order.
+        Returns a list of tier names in order of preference.
+        """
+        user_dir = self._get_user_dir(user_id, username)
+        priority_file = user_dir / "image_priority.json"
+
+        default_priority = Config.IMAGE_GENERATION_PRIORITY
+
+        if priority_file.exists():
+            try:
+                with open(priority_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, list) and data:
+                    return data
+                elif isinstance(data, dict) and 'priority' in data:
+                    return data['priority']
+            except Exception as e:
+                logger.error(f"Failed to load image priority for user {user_id}: {e}")
+
+        return default_priority
+
+    async def save_image_generation_priority(self, user_id: int, username: Optional[str],
+                                             priority_list: List[str]) -> bool:
+        """
+        Save the user's preferred image generation tier priority order.
+        """
+        user_dir = self._get_user_dir(user_id, username)
+        priority_file = user_dir / "image_priority.json"
+
+        try:
+            data = {
+                "priority": priority_list,
+                "last_updated": datetime.now().isoformat(),
+                "user_id": user_id
+            }
+            with open(priority_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logger.info(f"Saved image priority for user {user_id}: {priority_list}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to save image priority for user {user_id}: {e}")
+            return False
+
+    async def get_available_tiers(self) -> Dict[str, bool]:
+        """Get all available image generation tiers and their status."""
+        return {
+            "pollinations": True,  # Always available
+            "huggingface": bool(Config.HUGGINGFACE_API_KEY),
+            "openrouter": bool(Config.OPENROUTER_API_KEY),
+        }
+
+    # ---------- RESPONSE MODE (Legacy wrapper) ----------
+    async def get_response_mode_legacy(self, user_id: int, username: Optional[str] = None) -> str:
+        """
+        Legacy method – use get_response_mode() instead.
+        Kept for backward compatibility.
+        """
+        return await self.get_response_mode(user_id, username)
+
+    async def set_response_mode_legacy(self, user_id: int, username: Optional[str], mode: str) -> bool:
+        """
+        Legacy method – use set_response_mode() instead.
+        Kept for backward compatibility.
+        """
+        return await self.set_response_mode(user_id, mode, username)
+
+    def get_info(self) -> Dict[str, Any]:
+        """Return information about the manager."""
+        return {
+            "type": "UserDataManager",
+            "base_dir": str(self.base_dir),
+            "cache_size": len(self.cache),
+            "recent_conversations": len(self.recent_conversations),
+            "preference_manager": self.preference_manager.get_info() if hasattr(self.preference_manager, 'get_info') else {}
+        }

@@ -7,7 +7,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.error import NetworkError, TimedOut
 from core.config import Config
 from core.engines.base_engine import BaseEngine
-from core.engines.voice_engine import VoiceEngine
+from core.engines.analysis.voice_engine import VoiceEngine
 from core.managers.rate_limiter import RateLimiter
 from core.managers.user_data_manager import UserDataManager
 from core.managers.proxy_manager import ProxyManager
@@ -111,12 +111,13 @@ def main() -> None:
     application.add_handler(CommandHandler("clear", handlers.clear_history))
     application.add_handler(CommandHandler("prioritize_text_engine", handlers.prioritize_text_engine))
     application.add_handler(CommandHandler("prioritize_vision_engine", handlers.prioritize_vision_engine))
+    # FIXED: Shortened command name (was 35 chars, now 15)
+    application.add_handler(CommandHandler("image_priority", handlers.prioritize_image_generation_method))
 
     # ---------- Message Handlers ----------
     logger.info("📋 Registering message handlers...")
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handlers.handle_photo))
-    # Voice handler – only if voice engine is ready
     if voice_ready:
         application.add_handler(MessageHandler(filters.VOICE, handlers.handle_voice))
         logger.info("✅ Voice handler registered")

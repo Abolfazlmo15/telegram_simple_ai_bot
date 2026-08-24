@@ -1,20 +1,29 @@
 import logging
 import time
 import asyncio
-from pathlib import Path
-from datetime import datetime
+import re
 import httpx
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.error import NetworkError, TimedOut
 from core.config import Config
 from core.engines.base_engine import BaseEngine
-from core.engines.voice_engine import VoiceEngine
+from core.engines.analysis.voice_engine import VoiceEngine
 from core.managers.rate_limiter import RateLimiter
 from core.managers.user_data_manager import UserDataManager
 from core.managers.proxy_manager import ProxyManager
 from core.analytics.analytics_engine import AnalyticsEngine
 from core.utils.response_formatter import ResponseFormatter
+
+# ============================================================
+# NEW: Import memory, topic, and preference managers
+# ============================================================
+from core.managers.memory_manager import MemoryManager
+from core.managers.topic_manager import TopicManager
+
+# Import TelegramFormatter from prompt_engineering
+from prompt_engineering.formatters import TelegramFormatter
+from prompt_engineering.refiners.context_refiner import ContextRefiner
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +39,34 @@ class BotHandlers:
         self.analytics_engine = analytics_engine
         self.proxy_manager = proxy_manager
         self.formatter = ResponseFormatter()
+        self.telegram_formatter = TelegramFormatter()
+
+        # ============================================================
+        # NEW: Initialize memory and topic managers
+        # ============================================================
+        self.memory_manager = MemoryManager(
+            base_dir=Config.USER_DATA_DIR,
+            max_short_term=Config.MEMORY_MAX_SHORT_TERM
+        )
+        self.topic_manager = TopicManager()
+
+        # Initialize ContextRefiner with the managers
+        self.context_refiner = ContextRefiner(
+            memory_manager=self.memory_manager,
+            topic_manager=self.topic_manager,
+            prompt_refiner=self.engine.prompt_refiner
+        )
+
+        # Set the text engine on the mode detector for LLM fallback
+        self.engine.mode_detector.set_text_engine(self.engine.text_engine)
+
+        logger.info("📋 BotHandlers initialized with Memory, Topic, and ContextRefiner")
 
     # ========== COMMAND HANDLERS ==========
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
         await self.user_data_manager.start_new_session(user.id, user.username)
 
-        # Save user info
         await self.user_data_manager.load_user_info(
             user.id, user.username,
             first_name=user.first_name or "",
@@ -44,7 +74,6 @@ class BotHandlers:
             bio=user.bio or "",
             phone_number=user.phone_number or ""
         )
-        # Save profile photo if available
         if user.get_profile_photos:
             photos = await user.get_profile_photos(limit=1)
             if photos.photos:
@@ -62,8 +91,12 @@ class BotHandlers:
             f"• 💼 Business & Professional Advice\n"
             f"• ✨ Creative Writing\n"
             f"• 🖼️ *Image Analysis* - Just send me a photo!\n"
-            f"• 🎤 *Voice Messages* - Send me a voice note!\n\n"
-            f"_Just type your question, send an image, or a voice message._"
+            f"• 🎤 *Voice Messages* - Send me a voice note!\n"
+            f"• 🎨 *Image Generation* - Say 'generate an image of ...'\n"
+            f"• 🔊 *Voice Generation* - Say 'say this ...' or 'speak this ...'\n"
+            f"• 🗣️ *Voice Mode* - Say 'talk to me' to switch to voice responses, or 'type it' for text\n"
+            f"• 🧠 *Memory* - I remember our conversations to give better answers\n\n"
+            f"_Just type your question, send an image, a voice message, or a generation command._"
         )
         await self._send_chunked_message(update, text)
 
@@ -76,11 +109,18 @@ class BotHandlers:
             f"/status - Check your usage\n"
             f"/clear - Clear your history\n"
             f"/prioritize_text_engine - Set priority for text models\n"
-            f"/prioritize_vision_engine - Set priority for vision models\n\n"
-            f"💡 *Tips:*\n"
-            f"• Be specific in your questions\n"
-            f"• Include context for better answers\n"
-            f"• Use code blocks for programming questions\n\n"
+            f"/prioritize_vision_engine - Set priority for vision models\n"
+            f"/image_priority - Set priority for image generation tiers\n\n"
+            f"💡 *Voice Mode:*\n"
+            f"• Say 'talk to me' to switch to voice responses\n"
+            f"• Say 'type it' or 'text mode' to switch back to text\n"
+            f"• Send a voice message to automatically respond in voice\n\n"
+            f"💡 *Memory:*\n"
+            f"• I remember recent conversations to give better answers\n"
+            f"• You can ask 'remember what we talked about?'\n\n"
+            f"💡 *Generation Tips:*\n"
+            f"• To generate an image, say: 'generate an image of ...'\n"
+            f"• To generate voice, say: 'say this ...' or 'speak this ...'\n\n"
             f"⌨️ *Markdown Support:*\n"
             f"Use `backticks` for code\n"
             f"Use *asterisks* for bold\n"
@@ -96,12 +136,18 @@ class BotHandlers:
             f"• 💾 *Smart Caching* - Instant answers to common questions\n"
             f"• 📊 *Analytics* - Continuous improvement\n"
             f"• 💬 *Context Awareness* - Remembers conversation history\n"
+            f"• 🧠 *Memory* - Long-term and short-term memory for better context\n"
             f"• 🎯 *Model Priority* - Customize your AI experience\n"
             f"• 🖼️ *Vision Capabilities* - Image analysis and description\n"
-            f"• 🎤 *Voice Transcription* - Send a voice note, get a reply\n\n"
+            f"• 🎤 *Voice Transcription* - Send a voice note, get a reply\n"
+            f"• 🎨 *Image Generation* - Generate images from text\n"
+            f"• 🔊 *Voice Generation* - Text-to-speech\n"
+            f"• 🗣️ *Voice Mode* - Talk to me and I'll respond in voice\n"
+            f"• 📊 *Topic Tracking* - I understand what topics we're discussing\n\n"
             f"*Powered by:*\n"
             f"• DeepSeek, Qwen, and Llama Vision models\n"
             f"• Whisper for speech-to-text\n"
+            f"• Stable Diffusion & DALL-E for image generation\n"
             f"• OpenRouter API\n"
             f"• Python & Telegram Bot API\n\n"
             f"Source: [`{Config.BOT_REPO_URL}`]({Config.BOT_REPO_URL})"
@@ -113,6 +159,10 @@ class BotHandlers:
         username = update.effective_user.username
         remaining = self.rate_limiter.get_remaining(user_id)
         stats = await self.user_data_manager.get_user_stats(user_id, username)
+
+        # Get memory stats
+        short_term = await self.memory_manager.get_short_term(user_id)
+        long_term = await self.memory_manager.get_long_term(user_id)
 
         text = f" *Your Status*\n\n"
         text += f"*Rate Limit:*\n"
@@ -130,6 +180,10 @@ class BotHandlers:
             text += f"*Usage Stats:*\n"
             text += f"No data available yet.\n"
 
+        text += f"\n*Memory Stats:*\n"
+        text += f"Short-term entries: {len(short_term)}\n"
+        text += f"Long-term summaries: {len(long_term)}\n"
+
         text = self.formatter.format_response(text)
         await self._send_chunked_message(update, text)
 
@@ -137,6 +191,8 @@ class BotHandlers:
         user = update.effective_user
         success = await self.user_data_manager.clear_user_data(user.id, user.username)
         if success:
+            await self.memory_manager.clear_memory(user.id)
+            await self.topic_manager.clear_topics(user.id)
             await update.message.reply_text(
                 "*🗑️ History Cleared*\n\n"
                 "Your conversation history and data have been cleared successfully.",
@@ -289,8 +345,150 @@ class BotHandlers:
             )
             await update.message.reply_text(text, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
 
+    # ========== IMAGE GENERATION PRIORITY ==========
+    async def prioritize_image_generation_method(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Set priority order for image generation tiers."""
+        user = update.effective_user
+        user_id = user.id
+        username = user.username
+
+        # Get available tiers
+        available_tiers = await self.user_data_manager.get_available_tiers()
+        enabled_tiers = [name for name, enabled in available_tiers.items() if enabled]
+
+        if not enabled_tiers:
+            await update.message.reply_text(
+                "❌ *No image generation tiers available.*\n\n"
+                "Please check your API keys and try again.",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        # Get current priority
+        current_priority = await self.user_data_manager.get_image_generation_priority(user_id, username)
+
+        # Build the message
+        tier_names = {
+            "pollinations": "🖼️ Pollinations.ai (Free)",
+            "huggingface": "🤗 Hugging Face (Free tier)",
+            "openrouter": "🔗 OpenRouter (Paid)"
+        }
+
+        current_list = "\n".join([f"{i + 1}. {tier_names.get(t, t)}" for i, t in enumerate(current_priority)])
+
+        available_list = "\n".join([f"• {tier_names.get(t, t)}" for t in enabled_tiers])
+
+        text = f"🎯 *Image Generation Priority Setup*\n\n"
+        text += f"*Current priority order:*\n{current_list}\n\n"
+        text += f"*Available tiers:*\n{available_list}\n\n"
+        text += f"To change the priority, send a list of tier names in order of preference.\n\n"
+        text += f"*Example:*\n"
+        text += f"`pollinations, huggingface, openrouter`\n\n"
+        text += f"*Or:*\n"
+        text += f"`huggingface, pollinations`\n\n"
+        text += f"_Type /cancel to cancel._"
+
+        context.user_data['setting_image_priority'] = True
+        await update.message.reply_text(text, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
+
+    async def handle_image_priority_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle the user's image priority input."""
+        if not context.user_data.get('setting_image_priority'):
+            return
+
+        user = update.effective_user
+        user_text = update.message.text.strip()
+
+        if user_text.lower() in ['cancel', 'stop', '/cancel']:
+            context.user_data.clear()
+            await update.message.reply_text(
+                "❌ *Priority setup cancelled.*",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        # Parse the priority list
+        parts = re.split(r'[,;\n]', user_text)
+        priority_list = []
+
+        for part in parts:
+            tier = part.strip().lower()
+            if tier in self.engine.image_generation_engine.tiers:
+                priority_list.append(tier)
+            elif tier == "pollinations":
+                priority_list.append("pollinations")
+            elif tier == "huggingface":
+                priority_list.append("huggingface")
+            elif tier == "openrouter":
+                priority_list.append("openrouter")
+
+        # Remove duplicates while preserving order
+        seen = set()
+        priority_list = [x for x in priority_list if not (x in seen or seen.add(x))]
+
+        # Validate
+        available_tiers = await self.user_data_manager.get_available_tiers()
+        valid_tiers = [name for name, enabled in available_tiers.items() if enabled]
+
+        invalid = [t for t in priority_list if t not in valid_tiers]
+        if invalid:
+            await update.message.reply_text(
+                f"❌ *Invalid tiers:* `{', '.join(invalid)}`\n\n"
+                f"Please choose from: `{', '.join(valid_tiers)}`",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        if not priority_list:
+            await update.message.reply_text(
+                "❌ *No valid tiers selected.*\n\n"
+                f"Please choose from: `{', '.join(valid_tiers)}`",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        # Add any missing valid tiers to the end
+        for tier in valid_tiers:
+            if tier not in priority_list:
+                priority_list.append(tier)
+
+        # Save the priority
+        success = await self.user_data_manager.save_image_generation_priority(user.id, user.username, priority_list)
+
+        if success:
+            tier_names = {
+                "pollinations": "Pollinations.ai (Free)",
+                "huggingface": "Hugging Face (Free tier)",
+                "openrouter": "OpenRouter (Paid)"
+            }
+            new_list = "\n".join([f"{i + 1}. {tier_names.get(t, t)}" for i, t in enumerate(priority_list)])
+
+            text = f"✅ *Priority saved!*\n\n"
+            text += f"*New priority order:*\n{new_list}\n\n"
+            text += f"The bot will now try tiers in this order for image generation."
+
+            await update.message.reply_text(text, parse_mode="Markdown", reply_to_message_id=update.message.message_id)
+        else:
+            await update.message.reply_text(
+                "❌ *Failed to save priority.*\n\n"
+                "Please try again.",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+
+        context.user_data.clear()
+
     # ========== MESSAGE HANDLERS ==========
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        # Check if we're in priority setup mode
+        if context.user_data.get('setting_image_priority'):
+            await self.handle_image_priority_input(update, context)
+            return
+
         if context.user_data.get('setting_priority'):
             await self.handle_priority_input(update, context)
             return
@@ -313,7 +511,7 @@ class BotHandlers:
             await update.message.reply_text("Please send me a text message.", reply_to_message_id=update.message.message_id)
             return
 
-        # Check if user is asking about past conversation
+        # Check if user is asking about past conversation (memory)
         memory_keywords = ["remember", "before", "previous", "past", "earlier", "last time", "what did we", "what did you", "search history"]
         if any(kw in user_text.lower() for kw in memory_keywords):
             history_results = await self.user_data_manager.search_history(user_id, user_text)
@@ -329,6 +527,9 @@ class BotHandlers:
                     elif entry.get('type') == 'voice':
                         context_text += f"• You sent a voice message: {entry.get('transcription', '')}\n"
                         context_text += f"  Me: {entry.get('response', '')}\n\n"
+                    elif entry.get('type') in ('generated_image', 'generated_voice'):
+                        context_text += f"• You generated: {entry.get('prompt', '')}\n"
+                        context_text += f"  Result: {entry.get('response', '')}\n\n"
                 context_text += "Is that what you were looking for?"
                 await update.message.reply_text(context_text, reply_to_message_id=update.message.message_id)
                 return
@@ -352,33 +553,142 @@ class BotHandlers:
             user_data = await self.user_data_manager.load_user_data(user_id, username)
             history = user_data.get('history', [])
 
-            response, model_used, tokens_used = await self.engine.process(
+            # ============================================================
+            # NEW: Update memory and topic tracking
+            # ============================================================
+            # Add user message to memory
+            await self.memory_manager.add_interaction(
+                user_id=user_id,
+                message=user_text,
+                response="",  # Will be updated after response
+                category="text"
+            )
+
+            # Detect and track topic
+            detected_topic = await self.topic_manager.add_message(user_id, user_text)
+            if detected_topic:
+                logger.info(f"📊 Topic detected: {detected_topic}")
+
+            # Get memory context for the engine
+            memory_context = await self.memory_manager.get_context(user_id, limit=5)
+
+            # ============================================================
+            # NEW: Get user preferences
+            # ============================================================
+            preferences = await self.user_data_manager.get_preferences(user_id, username)
+            custom_instructions = await self.user_data_manager.get_custom_instructions(user_id, username)
+
+            # ============================================================
+            # Process via base engine – pass memory and preferences
+            # ============================================================
+            result, model_used, metadata = await self.engine.process(
                 user_text,
-                context={'user_id': user_id, 'username': username, 'history': history, 'skip_cache': skip_cache}
+                context={
+                    'user_id': user_id,
+                    'username': username,
+                    'history': history,
+                    'skip_cache': skip_cache,
+                    'input_type': 'text',
+                    'preferences': preferences,
+                    'custom_instructions': custom_instructions,
+                    'memory_context': memory_context,
+                    'current_topic': detected_topic
+                }
             )
 
             response_time = time.time() - start_time
-            formatted_response = self.formatter.format_response(response)
-            await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
 
-            asyncio.create_task(
-                self.user_data_manager.add_message_to_history(
-                    user_id=user_id,
-                    username=username,
-                    message=user_text,
-                    response=response,
-                    category="text",
-                    response_time=response_time,
-                    tokens_used=tokens_used
-                )
-            )
+            # Check if the result is a generation (bytes) or text
+            if isinstance(result, bytes):
+                # Check for image generation
+                if model_used.startswith("gen_image:"):
+                    logger.info(f"📸 Generated image for user {user_id} using {model_used}")
+                    # Get the refined prompt from the generation context or use the original
+                    last_gen = await self.engine.generation_context.get_last_generation(user_id)
+                    prompt = last_gen.get('prompt', user_text) if last_gen else user_text
+                    style = last_gen.get('style', 'no_style') if last_gen else 'no_style'
 
-            self.analytics_engine.record_message(
-                user_id=user_id,
-                category="text",
-                response_time=response_time
-            )
-            logger.info(f"Message processed for user {user_id} in {response_time:.2f}s using {model_used} (tokens: {tokens_used})")
+                    # Format caption with safe Markdown (no HTML details)
+                    caption = self.telegram_formatter.format_generated_image_caption(
+                        prompt=prompt,
+                        style=style,
+                        model=model_used,
+                        source="AI"
+                    )
+
+                    await placeholder.delete()
+
+                    # Send image with Markdown caption
+                    await update.message.reply_photo(
+                        photo=result,
+                        caption=caption,
+                        parse_mode="Markdown",
+                        reply_to_message_id=update.message.message_id
+                    )
+
+                    # If prompt is long, send the full prompt in a separate message
+                    if len(prompt) > 150:
+                        full_prompt_msg = self.telegram_formatter.format_full_prompt_message(prompt)
+                        await update.message.reply_text(
+                            full_prompt_msg,
+                            parse_mode="Markdown",
+                            reply_to_message_id=update.message.message_id
+                        )
+
+                # Check for voice generation (both explicit and conversation mode)
+                elif model_used.startswith("gen_voice") or model_used.startswith("gen_voice_conversation"):
+                    logger.info(f"🔊 Voice response for user {user_id} using {model_used}")
+                    await placeholder.delete()
+                    await update.message.reply_voice(
+                        voice=result,
+                        caption=f"🔊 *Voice Response*\n\n_Listen above_",
+                        parse_mode="Markdown",
+                        reply_to_message_id=update.message.message_id
+                    )
+
+                else:
+                    # Unexpected bytes
+                    logger.warning(f"Received bytes but model {model_used} not recognized as generation")
+                    await placeholder.edit_text(
+                        "❌ *Unexpected response format.*\n\n"
+                        "Please try again.",
+                        parse_mode="Markdown"
+                    )
+            else:
+                # It's text response (analysis or mode switch)
+                formatted_response = self.formatter.format_response(result)
+                await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
+
+                # Save text history only if it's not a mode switch message
+                if not model_used.startswith("mode_switch"):
+                    # Update memory with the response
+                    await self.memory_manager.add_interaction(
+                        user_id=user_id,
+                        message=user_text,
+                        response=result,
+                        category="text"
+                    )
+
+                    asyncio.create_task(
+                        self.user_data_manager.add_message_to_history(
+                            user_id=user_id,
+                            username=username,
+                            message=user_text,
+                            response=result,
+                            category="text",
+                            response_time=response_time,
+                            tokens_used=metadata
+                        )
+                    )
+
+                    self.analytics_engine.record_message(
+                        user_id=user_id,
+                        category="text",
+                        response_time=response_time
+                    )
+                    logger.info(f"Message processed for user {user_id} in {response_time:.2f}s using {model_used} (tokens: {metadata})")
+                else:
+                    logger.info(f"Mode switch message for user {user_id}: {result[:50]}...")
 
         except NetworkError as e:
             logger.error(f"Network error for user {user_id}: {e}")
@@ -481,7 +791,7 @@ class BotHandlers:
             logger.info("🔵 Calling engine.process with image bytes")
             response, model_used, tokens_used = await self.engine.process(
                 bytes(image_bytes),
-                context={'query_text': query_text, 'user_id': user_id, 'username': username}
+                context={'query_text': query_text, 'user_id': user_id, 'username': username, 'input_type': 'image'}
             )
             response_time = time.time() - start_time
             logger.info(f"✅ Vision response using {model_used} (tokens: {tokens_used})")
@@ -523,17 +833,14 @@ class BotHandlers:
         voice = update.message.voice
         file = await voice.get_file()
 
-        # Get the full file URL
         full_file_url = file.file_path
         logger.info(f"🔊 Full file URL: {full_file_url}")
 
-        # Extract relative path after /file/
         if "/file/" in full_file_url:
             relative_path = full_file_url.split("/file/", 1)[1]
         else:
             relative_path = full_file_url
 
-        # Build proxy URL
         proxy_base = self.proxy_manager.get_proxy().rstrip('/')
         proxy_file_url = f"{proxy_base}/file/{relative_path}"
         logger.info(f"🔊 Proxy file URL: {proxy_file_url}")
@@ -565,7 +872,7 @@ class BotHandlers:
             await update.message.reply_text("❌ Failed to download voice message. Please try again.", reply_to_message_id=update.message.message_id)
             return
 
-        # Save audio file
+        # Save the audio file
         audio_file_path = await self.user_data_manager.save_audio_file(user_id, username, audio_bytes)
         self.user_data_manager.prune_voices(user_id, username, max_files=5)
         logger.info(f"🔊 Audio saved to {audio_file_path}")
@@ -574,34 +881,86 @@ class BotHandlers:
 
         start_time = time.time()
         try:
+            # Transcribe the audio
             transcription, voice_model, tokens_used = await self.voice_engine.transcribe(
                 audio_bytes,
                 context={'user_id': user_id, 'username': username}
             )
             logger.info(f"🔊 Transcription: {transcription[:50]}...")
 
-            # Get response using text engine
+            # Update memory with the transcription
+            await self.memory_manager.add_interaction(
+                user_id=user_id,
+                message=f"[Voice message] {transcription}",
+                response="",
+                category="voice"
+            )
+
+            # Process the transcription through the main engine
             user_data = await self.user_data_manager.load_user_data(user_id, username)
             history = user_data.get('history', [])
-            response, text_model, text_tokens = await self.engine.text_engine.process(
+
+            # Get memory context and preferences
+            memory_context = await self.memory_manager.get_context(user_id, limit=5)
+            preferences = await self.user_data_manager.get_preferences(user_id, username)
+
+            result, model_used, metadata = await self.engine.process(
                 transcription,
-                context={'user_id': user_id, 'username': username, 'history': history, 'skip_cache': True}
+                context={
+                    'user_id': user_id,
+                    'username': username,
+                    'history': history,
+                    'skip_cache': True,
+                    'input_type': 'voice',
+                    'preferences': preferences,
+                    'memory_context': memory_context
+                }
             )
+
             response_time = time.time() - start_time
-            total_tokens = tokens_used + text_tokens
+            total_tokens = tokens_used + (metadata if isinstance(metadata, int) else 0)
 
-            formatted_response = self.formatter.format_response(response)
-            await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
+            # Handle response
+            if isinstance(result, bytes) and (model_used.startswith("gen_voice") or model_used.startswith("gen_voice_conversation")):
+                # Voice response
+                logger.info(f"🔊 Voice response to voice message using {model_used}")
+                await placeholder.delete()
+                await update.message.reply_voice(
+                    voice=result,
+                    caption=f"🔊 *Voice Response*\n\n_Listen above_",
+                    parse_mode="Markdown",
+                    reply_to_message_id=update.message.message_id
+                )
+                # Update memory with the response
+                await self.memory_manager.add_interaction(
+                    user_id=user_id,
+                    message=f"[Voice message] {transcription}",
+                    response="[Voice response generated]",
+                    category="voice"
+                )
+            else:
+                # Text response (fallback or when mode is text)
+                formatted_response = self.formatter.format_response(result if isinstance(result, str) else transcription)
+                await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
 
-            await self.user_data_manager.add_voice_to_history(
-                user_id=user_id,
-                username=username,
-                transcription=transcription,
-                response=response,
-                audio_file=audio_file_path,
-                response_time=response_time,
-                tokens_used=total_tokens
-            )
+                # Save voice history with text response
+                await self.user_data_manager.add_voice_to_history(
+                    user_id=user_id,
+                    username=username,
+                    transcription=transcription,
+                    response=result if isinstance(result, str) else "Voice response generated",
+                    audio_file=audio_file_path,
+                    response_time=response_time,
+                    tokens_used=total_tokens
+                )
+
+                # Update memory with the response
+                await self.memory_manager.add_interaction(
+                    user_id=user_id,
+                    message=f"[Voice message] {transcription}",
+                    response=result if isinstance(result, str) else "Voice response generated",
+                    category="voice"
+                )
 
             self.analytics_engine.record_message(
                 user_id=user_id,
@@ -609,7 +968,7 @@ class BotHandlers:
                 response_time=response_time
             )
 
-            logger.info(f"🔊 Voice handled in {response_time:.2f}s using {voice_model} + {text_model} (tokens: {total_tokens})")
+            logger.info(f"🔊 Voice handled in {response_time:.2f}s using {voice_model} + {model_used} (tokens: {total_tokens})")
 
         except Exception as e:
             logger.error(f"❌ Voice error: {e}", exc_info=True)
