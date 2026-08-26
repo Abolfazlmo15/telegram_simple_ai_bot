@@ -13,6 +13,7 @@ from core.managers.proxy_manager import ProxyManager
 from core.managers.health_checker import HealthChecker
 from core.managers.cache_manager import CacheManager
 from core.analytics.analytics_engine import AnalyticsEngine
+# Import the new combined BotHandlers
 from handlers.bot_handlers import BotHandlers
 
 app = Flask(__name__)
@@ -70,7 +71,7 @@ def init_telegram_app():
 
     _proxy_manager = ProxyManager()
 
-    # Handlers
+    # Handlers – now uses the new combined BotHandlers
     _handlers = BotHandlers(
         engine=_engine,
         voice_engine=_voice_engine,
