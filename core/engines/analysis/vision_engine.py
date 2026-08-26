@@ -1,83 +1,86 @@
-"""Vision/Image processing engine – tries Hugging Face (many models) then OpenRouter (dynamic)."""
+"""Voice/Speech-to-Text processing engine using local Whisper with OpenRouter fallback and priority support."""
 import logging
 import asyncio
-import base64
-import json
 import time
+import httpx  # <--- ADDED missing import
 from typing import Dict, Tuple, Optional, Any, List
-import httpx
-from PIL import Image
 import io
 from core.config import Config
-from core.managers.vision_model_manager import VisionModelManager
-from core.utils.image_processor import ImageProcessor
 from core.managers.user_data_manager import UserDataManager
 
 logger = logging.getLogger(__name__)
 
+# Try to import whisper – if not available, engine will rely on OpenRouter fallback
+try:
+    import whisper
+    WHISPER_AVAILABLE = True
+except ImportError:
+    WHISPER_AVAILABLE = False
+    logger.warning("Whisper not installed. Voice engine will rely on OpenRouter fallback.")
 
-class VisionEngine:
+
+class VoiceEngine:
     def __init__(self, user_data_manager: Optional[UserDataManager] = None):
-        self.api_key = Config.OPENROUTER_API_KEY
-        self.base_url = Config.OPENROUTER_BASE_URL
-        self.model_manager = VisionModelManager()
-        self.image_processor = ImageProcessor(max_size=128, quality=60)
-        self._client: Optional[httpx.AsyncClient] = None
-        self.is_initialized = False
         self.user_data_manager = user_data_manager
+        self.is_initialized = False
+        self.model = None
+        self.model_name = "base"  # can be "tiny", "base", "small", "medium", "large"
 
-        # Hugging Face token
-        self._hf_token = Config.HUGGINGFACE_TOKEN
-        self._fallback_timeout = Config.VISION_FALLBACK_TIMEOUT
-
-        # OpenRouter blacklisting (for models that fail)
+        # ============================================================
+        # OpenRouter fallback models + blacklisting
+        # ============================================================
+        self.openrouter_models = Config.DEFAULT_VOICE_ENGINE_PRIORITY
         self._model_failures: Dict[str, float] = {}
         self._blacklist_ttl = Config.MODEL_FAILURE_BLACKLIST_TTL_SECONDS
         self._non_retryable_errors = {404, 400, 402, 429}
+        self._client = None  # Will be initialized for OpenRouter fallback
 
-        # We'll use the main client for all calls
-
-        logger.info("🔷 VisionEngine initialized (HF models → OpenRouter dynamic)")
+        logger.info("🔊 VoiceEngine __init__ done (with priority & blacklisting)")
 
     async def initialize(self) -> bool:
-        logger.info("🔷 VisionEngine.initialize: START")
+        logger.info("🔊 VoiceEngine.initialize: START")
+
+        # Initialize local Whisper if available
+        if WHISPER_AVAILABLE:
+            try:
+                logger.info(f"🔊 Loading Whisper model: {self.model_name}...")
+                self.model = await asyncio.to_thread(whisper.load_model, self.model_name)
+                self.is_initialized = True
+                logger.info(f"🔊 Whisper model '{self.model_name}' loaded successfully")
+                return True
+            except Exception as e:
+                logger.error(f"❌ Failed to load Whisper model: {e}", exc_info=True)
+                # Fall through to initialize OpenRouter client
+        else:
+            logger.warning("Whisper module not installed. Will use OpenRouter fallback only.")
+
+        # Initialize HTTP client for OpenRouter fallback
         try:
-            self.model_manager.start()
-            logger.info("🔷 VisionModelManager started")
+            import httpx
             timeout = httpx.Timeout(connect=10.0, read=Config.HTTP_TIMEOUT, write=10.0, pool=10.0)
             try:
-                self._client = httpx.AsyncClient(
-                    timeout=timeout,
-                    http2=True,
-                    limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
-                )
-                logger.info("🔷 Main HTTP client created (HTTP/2)")
+                self._client = httpx.AsyncClient(timeout=timeout, http2=True)
+                logger.info("🔊 VoiceEngine OpenRouter client with HTTP/2")
             except Exception:
-                self._client = httpx.AsyncClient(
-                    timeout=timeout,
-                    http2=False,
-                    limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
-                )
-                logger.info("🔷 Main HTTP client created (HTTP/1.1)")
-
+                self._client = httpx.AsyncClient(timeout=timeout, http2=False)
+                logger.info("🔊 VoiceEngine OpenRouter client with HTTP/1.1")
             self.is_initialized = True
-            logger.info("🔷 VisionEngine initialized successfully")
+            logger.info("🔊 VoiceEngine initialized with OpenRouter fallback client.")
             return True
         except Exception as e:
-            logger.error(f"❌ VisionEngine.initialize failed: {e}", exc_info=True)
+            logger.error(f"❌ Failed to initialize VoiceEngine: {e}")
             return False
 
     async def shutdown(self) -> None:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
-        self.model_manager.stop()
         self.is_initialized = False
-        logger.info("🔷 VisionEngine shutdown complete")
+        self.model = None
+        logger.info("🔊 VoiceEngine shutdown complete")
 
     def _is_model_blacklisted(self, model: str) -> bool:
         if model in self._model_failures:
-            elapsed = time.time() - self._model_failures[model]
-            if elapsed < self._blacklist_ttl:
+            if time.time() - self._model_failures[model] < self._blacklist_ttl:
                 return True
             else:
                 del self._model_failures[model]
@@ -85,227 +88,195 @@ class VisionEngine:
 
     def _mark_model_failure(self, model: str):
         self._model_failures[model] = time.time()
-        logger.info(f"🚫 Blacklisted {model} for {self._blacklist_ttl}s")
+        logger.info(f"🚫 Blacklisted OpenRouter STT model {model} for {self._blacklist_ttl}s")
 
-    async def process(self, input_data: Any, context: Optional[Dict] = None) -> Tuple[str, str, int]:
-        logger.info("🔷 VisionEngine.process: START")
-        if not self.is_initialized:
-            raise RuntimeError("Vision engine not initialized")
-
-        user_id = context.get('user_id') if context else None
-        username = context.get('username') if context else None
-        query_text = context.get('query_text', '').strip() if context else ''
-        priority_list = context.get('priority_list') if context else None
-        logger.info(f"🔷 user_id: {user_id}, query: {query_text[:50] if query_text else '(empty)'}...")
-
-        try:
-            processed_image = await self.image_processor.process_image(input_data)
-            logger.info(f"🔷 Image processed: {processed_image.size[0]}x{processed_image.size[1]}")
-            pil_image = processed_image
-        except Exception as e:
-            logger.error(f"❌ Image processing failed: {e}", exc_info=True)
-            raise ValueError(f"Could not process image: {e}")
-
-        # Convert to bytes and base64 once
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format="JPEG", quality=85)
-        image_bytes = buffer.getvalue()
-        base64_image = base64.b64encode(image_bytes).decode('utf-8')
-
-        # ============================================================
-        # 1. TRY HUGGING FACE (many models, ordered by reliability)
-        # ============================================================
-        if self._hf_token and len(self._hf_token) > 10:
-            logger.info("🔷 Trying Hugging Face (many models)...")
-            hf_models = Config.HUGGINGFACE_VISION_MODELS
-            for model in hf_models:
-                if self._is_model_blacklisted(model):
-                    logger.info(f"Skipping blacklisted HF model: {model}")
-                    continue
-                try:
-                    logger.info(f"🔷 HF model: {model}")
-                    response, model_used, tokens = await self._call_huggingface(pil_image, query_text, model)
-                    if response and len(response) > 5:
-                        logger.info(f"✅ Hugging Face succeeded with {model_used}")
-                        return response, model_used, tokens
-                except httpx.ConnectError:
-                    logger.warning(f"HF {model}: Connection error (DNS/network).")
-                    # If we get a ConnectError, it's likely a DNS issue; break to avoid wasting time on all models.
-                    # But we'll continue to next model because maybe the next one has a different endpoint? Usually DNS is global.
-                    # We'll try a few more before breaking.
-                    continue
-                except Exception as e:
-                    logger.warning(f"HF {model} failed: {e}")
-                    # Mark as failed to avoid retrying
-                    self._mark_model_failure(model)
-        else:
-            logger.warning("🔷 Hugging Face token not set. Skipping.")
-
-        # ============================================================
-        # 2. TRY OPENROUTER (dynamic + fallback list)
-        # ============================================================
-        logger.info("🔷 Trying OpenRouter (dynamic models)...")
-        try:
-            # Get dynamic models from manager
-            dynamic_models = self.model_manager.get_available_models()
-            # Combine with hardcoded fallback (if any)
-            fallback_models = Config.OPENROUTER_VISION_MODELS
-            # Build model list: user priority -> dynamic -> fallback
-            model_list = self._get_model_list(priority_list, dynamic_models, fallback_models)
-            if model_list:
-                result = await self._try_openrouter_models(model_list, base64_image, query_text)
-                if result:
-                    response, model, tokens = result
-                    logger.info(f"✅ OpenRouter succeeded with {model}")
-                    return response, model, tokens
-        except Exception as e:
-            logger.warning(f"OpenRouter failed: {e}")
-
-        # ============================================================
-        # 3. ULTIMATE FALLBACK: PIL METADATA
-        # ============================================================
-        logger.warning("All providers failed. Using PIL metadata fallback.")
-        width, height = pil_image.size
-        mode = pil_image.mode
-        format_name = pil_image.format or "Unknown"
-        response_text = (
-            f"📷 *Image Metadata*\n\n"
-            f"• Format: {format_name}\n"
-            f"• Size: {width} x {height} pixels\n"
-            f"• Mode: {mode}\n\n"
-            "Could not get AI description. Please check your Hugging Face token or OpenRouter API key."
-        )
-        return response_text, "pil-fallback", len(response_text) // 4
-
-    # ---------- HUGGING FACE ----------
-    async def _call_huggingface(self, pil_image: Image.Image, query: str, model: str) -> Tuple[str, str, int]:
-        url = f"https://api-inference.huggingface.co/models/{model}"
-        headers = {"Authorization": f"Bearer {self._hf_token}"}
-
-        # Send image as bytes with proper content type
-        buffer = io.BytesIO()
-        pil_image.save(buffer, format="JPEG", quality=85)
-        image_bytes = buffer.getvalue()
-
-        # Try raw image (most models accept this)
-        resp = await self._client.post(
-            url,
-            headers=headers,
-            content=image_bytes,
-            timeout=self._fallback_timeout
-        )
-        resp.raise_for_status()
-        data = resp.json()
-
-        # Parse response
-        if isinstance(data, list) and len(data) > 0:
-            if isinstance(data[0], dict) and "generated_text" in data[0]:
-                response_text = data[0]["generated_text"]
-            else:
-                response_text = str(data[0])
-        else:
-            response_text = str(data)
-
-        tokens_used = len(response_text) // 4
-        return response_text, f"huggingface-{model}", tokens_used
-
-    # ---------- OPENROUTER ----------
-    def _get_model_list(self, priority_list: Optional[List[str]], dynamic_models: List[str], fallback_models: List[str]) -> List[str]:
+    def _get_model_list(self, priority_list: Optional[List[str]], fallback_list: List[str]) -> List[str]:
         ordered = []
         seen = set()
-
-        # 1. User priority (if any)
         if priority_list:
             for m in priority_list:
                 if m not in seen and not self._is_model_blacklisted(m):
                     ordered.append(m)
                     seen.add(m)
-
-        # 2. Dynamic models from manager (live)
-        for m in dynamic_models:
+        for m in fallback_list:
             if m not in seen and not self._is_model_blacklisted(m):
                 ordered.append(m)
                 seen.add(m)
-
-        # 3. Hardcoded fallback
-        for m in fallback_models:
-            if m not in seen and not self._is_model_blacklisted(m):
-                ordered.append(m)
-                seen.add(m)
-
+        if not ordered:
+            logger.warning("All STT models blacklisted, returning full fallback list.")
+            return list(dict.fromkeys(fallback_list))
         return ordered
 
-    async def _try_openrouter_models(self, model_list: List[str], base64_image: str, query: str) -> Optional[Tuple[str, str, int]]:
-        # Build system prompt (generic description)
-        system_prompt = self._build_vision_prompt(query)
+    async def transcribe(self, audio_bytes: bytes, context: Optional[Dict] = None) -> Tuple[str, str, int]:
+        """
+        Transcribe audio using local Whisper (primary) or OpenRouter (fallback with priority).
+        Returns: (transcription_text, model_used, tokens_used)
+        """
+        if not self.is_initialized:
+            raise RuntimeError("Voice engine not initialized")
 
-        for model in model_list:
+        logger.info(f"🔊 Transcribing audio (size: {len(audio_bytes)} bytes)")
+
+        # ============================================================
+        # PRIORITY 1: Local Whisper (if available)
+        # ============================================================
+        if self.model:
+            try:
+                import tempfile
+                with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as tmp:
+                    tmp.write(audio_bytes)
+                    tmp_path = tmp.name
+
+                result = await asyncio.to_thread(
+                    self.model.transcribe,
+                    tmp_path,
+                    language=None,
+                    task="transcribe",
+                    fp16=False
+                )
+                import os
+                os.unlink(tmp_path)
+                transcription = result.get("text", "").strip()
+                tokens_used = len(transcription) // 4
+                logger.info(f"🔊 Local Whisper transcription: {transcription[:50]}...")
+                return transcription, f"whisper-{self.model_name}", tokens_used
+            except Exception as e:
+                logger.error(f"❌ Local Whisper failed: {e}. Falling back to OpenRouter.")
+
+        # ============================================================
+        # PRIORITY 2: OpenRouter Fallback (with priority & blacklisting)
+        # ============================================================
+        if not self._client:
+            raise RuntimeError("No transcription method available (Whisper failed and OpenRouter client not initialized).")
+
+        priority_list = context.get('priority_list') if context else None
+        model_list = self._get_model_list(priority_list, self.openrouter_models)
+        logger.info(f"📋 Trying OpenRouter STT models: {model_list[:3]}...")
+
+        last_error = None
+
+        # Parallel testing for OpenRouter models
+        if Config.ENABLE_PARALLEL_MODEL_TESTING and len(model_list) > 1:
+            result = await self._try_stt_parallel_first_completed(
+                model_list[:Config.PARALLEL_MODEL_ATTEMPTS],
+                audio_bytes
+            )
+            if result:
+                response, model, tokens, error = result
+                if response is not None:
+                    logger.info(f"✅ OpenRouter STT parallel success on {model}")
+                    return response, model, tokens
+                elif error:
+                    self._mark_model_failure(model)
+                    last_error = error
+
+            remaining_models = model_list[Config.PARALLEL_MODEL_ATTEMPTS:]
+            logger.info(f"Parallel STT failed, falling back to sequential for {len(remaining_models)} models")
+        else:
+            remaining_models = model_list
+
+        # Sequential fallback
+        for model in remaining_models:
             for attempt in range(Config.HTTP_MAX_RETRIES):
                 try:
-                    logger.info(f"🔷 OR model: {model} (attempt {attempt+1})")
-                    response, tokens_used = await self._call_openrouter(model, base64_image, query, system_prompt)
-                    if response and len(response) > 5:
-                        return (response, model, tokens_used)
+                    logger.info(f"🔊 Trying OpenRouter STT: {model} (attempt {attempt+1})")
+                    response, tokens = await self._call_openrouter_stt(model, audio_bytes)
+                    logger.info(f"✅ OpenRouter STT {model} succeeded")
+                    return response, model, tokens
                 except httpx.HTTPStatusError as e:
                     if e.response.status_code in self._non_retryable_errors:
+                        logger.warning(f"Non-retryable error {e.response.status_code} for {model}, blacklisting.")
                         self._mark_model_failure(model)
                         break
-                    if attempt < Config.HTTP_MAX_RETRIES - 1:
-                        await asyncio.sleep(0.5)
+                    else:
+                        logger.warning(f"OpenRouter STT {model} attempt {attempt+1} failed: {e}")
+                        last_error = e
+                        if attempt < Config.HTTP_MAX_RETRIES - 1:
+                            await asyncio.sleep(0.5)
+                        else:
+                            self._mark_model_failure(model)
+                            break
                 except Exception as e:
+                    logger.warning(f"OpenRouter STT {model} attempt {attempt+1} failed: {e}")
+                    last_error = e
                     if attempt < Config.HTTP_MAX_RETRIES - 1:
                         await asyncio.sleep(0.5)
+                    else:
+                        self._mark_model_failure(model)
+                        break
+
+        raise Exception(f"All transcription methods failed. Last error: {last_error}")
+
+    async def _try_stt_parallel_first_completed(self, models: List[str], audio_bytes: bytes) -> Optional[Tuple[Optional[str], str, int, Optional[Exception]]]:
+        tasks = {}
+        for model in models:
+            task = asyncio.create_task(self._call_openrouter_stt_with_errors(model, audio_bytes))
+            tasks[task] = model
+
+        pending = set(tasks.keys())
+        while pending:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                model = tasks[task]
+                try:
+                    text, tokens = task.result()
+                    if text is not None:
+                        for t in pending:
+                            t.cancel()
+                        return (text, model, tokens, None)
+                except Exception as e:
+                    last_error = e
+                    # Continue waiting for other models
+            if not pending:
+                break
+
         return None
 
-    async def _call_openrouter(self, model: str, base64_image: str, query: str, system_prompt: str) -> Tuple[str, int]:
+    async def _call_openrouter_stt_with_errors(self, model: str, audio_bytes: bytes) -> Tuple[str, int]:
+        try:
+            return await self._call_openrouter_stt(model, audio_bytes)
+        except Exception as e:
+            raise e
+
+    async def _call_openrouter_stt(self, model: str, audio_bytes: bytes) -> Tuple[str, int]:
+        """
+        Call OpenRouter Whisper API for transcription using multipart file upload.
+        This fixes the 400 Bad Request error.
+        """
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
+            "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
             "HTTP-Referer": Config.BOT_REPO_URL,
             "X-Title": Config.BOT_NAME
         }
-        user_content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}]
-        if query and query.lower() not in ["describe this image", "describe the image", "what is in this image"]:
-            user_content.append({"type": "text", "text": query})
 
-        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
-        payload = {"model": model, "messages": messages, "max_tokens": 1500}
+        # Prepare multipart/form-data fields
+        files = {
+            "audio": ("audio.ogg", audio_bytes, "audio/ogg"),
+            "model": (None, model),
+            "response_format": (None, "text")
+        }
 
-        resp = await self._client.post(self.base_url, headers=headers, json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        response_text = data["choices"][0]["message"]["content"]
-        tokens_used = data.get("usage", {}).get("total_tokens", 0)
-        return response_text, tokens_used
-
-    # ---------- PROMPT BUILDER ----------
-    def _build_vision_prompt(self, user_query: str) -> str:
-        generic_phrases = [
-            "describe this image", "describe the image",
-            "what is in this image", "what is in the image",
-            "image analysis", "analyze this image", "analyze the image"
-        ]
-        if not user_query or user_query.lower() in generic_phrases:
-            return (
-                "You are an expert visual analyst. Provide a detailed, accurate description of the image.\n"
-                "If the image contains text, transcribe it accurately. Describe objects, people, colors, layout, and context.\n"
-                "Keep the description clear, well-structured, and use plain text (no markdown)."
+        try:
+            resp = await self._client.post(
+                "https://openrouter.ai/api/v1/audio/transcriptions",
+                headers=headers,
+                files=files,
+                timeout=30.0
             )
-        else:
-            return (
-                "You are an expert visual analyst. The user has asked a specific question about the image.\n"
-                "Use the image content to answer the user's question accurately and thoroughly.\n"
-                "If the question is about an opinion (e.g., 'what is beautiful'), give your subjective analysis based on the image.\n"
-                "Provide a clear, well-structured response in plain text (no markdown).\n\n"
-                f"User question: {user_query}"
-            )
+            resp.raise_for_status()
+            data = resp.json()
+            transcription = data.get("text", "").strip() if isinstance(data, dict) else str(data).strip()
+            tokens_used = len(transcription) // 4
+            return transcription, tokens_used
+        except Exception as e:
+            logger.error(f"OpenRouter STT call failed for {model}: {e}")
+            raise
 
     def get_engine_info(self) -> Dict:
         return {
-            "type": "VisionEngine",
+            "type": "VoiceEngine",
             "initialized": self.is_initialized,
-            "providers": ["huggingface", "openrouter"],
-            "hf_token": bool(self._hf_token),
-            "openrouter_key": bool(self.api_key),
+            "whisper_model": self.model_name if self.model else None,
+            "openrouter_fallback_enabled": self._client is not None,
             "blacklisted_models": list(self._model_failures.keys())
         }

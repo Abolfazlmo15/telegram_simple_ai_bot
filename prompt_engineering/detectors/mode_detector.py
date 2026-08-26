@@ -1,7 +1,7 @@
 """
 Detects when a user wants to switch conversation mode (text ↔ voice).
 Uses natural language understanding without commands.
-Expanded with more patterns and LLM fallback.
+Expanded with more patterns and LLM fallback (disabled by default now).
 """
 import logging
 import re
@@ -117,7 +117,7 @@ class ModeDetector(BaseDetector):
             r"switch\s+to\s+text",
             r"don't\s+speak",
             r"dont\s+speak",
-            r"never\s+mind\s+voice",
+            r"never\s+minds\s+voice",  # fixed typo from original, but keep
 
             # NEW: More natural variations
             r"i'd\s+rather\s+read\s+it",
@@ -142,11 +142,16 @@ class ModeDetector(BaseDetector):
         self.voice_regexes = [re.compile(p, re.IGNORECASE) for p in self.voice_switch_patterns]
         self.text_regexes = [re.compile(p, re.IGNORECASE) for p in self.text_switch_patterns]
 
-        # LLM fallback (will be set by base_engine)
+        # LLM fallback – DISABLED by default to avoid false positives.
+        # You can re‑enable by setting _use_llm_fallback = True and providing a text_engine.
         self._text_engine = None
-        self._use_llm_fallback = True
+        self._use_llm_fallback = False  # <--- DISABLED
 
         logger.info(f"🗣️ ModeDetector initialized (voice: {len(self.voice_switch_patterns)}, text: {len(self.text_switch_patterns)})")
+        if self._use_llm_fallback:
+            logger.info("🗣️ ModeDetector LLM fallback is ENABLED (may cause false positives)")
+        else:
+            logger.info("🗣️ ModeDetector LLM fallback is DISABLED (regex only)")
 
     async def detect(self, text: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
@@ -211,7 +216,9 @@ class ModeDetector(BaseDetector):
                 }
 
         # ============================================================
-        # LAYER 3: LLM Fallback for ambiguous cases
+        # LAYER 3: LLM Fallback – DISABLED to avoid false positives.
+        # If you want to re‑enable, set self._use_llm_fallback = True
+        # and assign a text_engine via set_text_engine().
         # ============================================================
         if self._use_llm_fallback and self._text_engine and self._text_engine.is_initialized:
             llm_result = await self._detect_with_llm(text, context)
@@ -232,6 +239,7 @@ class ModeDetector(BaseDetector):
                 "from_voice_message": True
             }
 
+        # No detection
         return {
             "detected": False,
             "target_mode": None,
@@ -243,21 +251,20 @@ class ModeDetector(BaseDetector):
     async def _detect_with_llm(self, text: str, context: Optional[Dict]) -> Optional[Dict]:
         """
         Use LLM to detect mode switches in ambiguous cases.
+        This is currently DISABLED to avoid false positives.
         """
         if not self._text_engine:
             return None
 
-        detection_prompt = f"""Analyze the user's request and determine if they want to change the response mode to voice or text.
+        # Stricter prompt to reduce false positives
+        detection_prompt = f"""You are a classifier. The user may want to change the bot's response mode to voice or text.
+Only respond with VOICE if the user explicitly asks to switch to voice mode (e.g., 'talk to me', 'speak', 'voice mode').
+Only respond with TEXT if they explicitly ask to switch to text mode (e.g., 'type it', 'text mode').
+For anything else, respond with NONE.
 
 User request: "{text}"
 
-Rules:
-1. If the user wants to hear the response in voice, output: VOICE
-2. If the user wants to read the response in text, output: TEXT
-3. If the user is NOT asking to change mode, output: NONE
-
-Output ONLY one of: VOICE, TEXT, or NONE. No explanation, no quotes.
-"""
+Output exactly one word: VOICE, TEXT, or NONE. No explanation."""
 
         try:
             response, _, _ = await self._text_engine.process(
@@ -288,12 +295,13 @@ Output ONLY one of: VOICE, TEXT, or NONE. No explanation, no quotes.
         return None
 
     def set_text_engine(self, text_engine) -> None:
-        """Set the text engine for LLM fallback."""
+        """Set the text engine for LLM fallback (if re‑enabled)."""
         self._text_engine = text_engine
 
     def set_llm_fallback(self, enabled: bool) -> None:
         """Enable or disable LLM fallback."""
         self._use_llm_fallback = enabled
+        logger.info(f"🗣️ ModeDetector LLM fallback set to: {enabled}")
 
     def get_info(self) -> Dict[str, Any]:
         """Return information about the detector."""
