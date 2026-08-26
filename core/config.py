@@ -42,49 +42,25 @@ class Config:
     IMAGE_GENERATION_QUALITY = "standard"
 
     # ============================================================
-    # MASSIVELY EXPANDED VISION MODELS FOR ANALYSIS
+    # UPDATED VISION MODELS – only reliable, verified ones
     # ============================================================
 
-    # ---------- Hugging Face (all free, require token) ----------
-    # Ordered by reliability/speed; the engine will try each in order.
+    # ---------- Hugging Face (reliable free models) ----------
     HUGGINGFACE_VISION_MODELS = [
-        # Best and most reliable
         "nlpconnect/vit-gpt2-image-captioning",
         "Salesforce/blip-image-captioning-large",
-        "Salesforce/blip-image-captioning-base",
         "microsoft/git-base-coco",
         "microsoft/git-large-coco",
         "ydshieh/vit-gpt2-coco-en",
-        # Good alternatives
-        "microsoft/Florence-2-large",
         "microsoft/Florence-2-base",
-        "Salesforce/blip2-opt-2.7b",
-        "Salesforce/blip2-opt-6.7b",
-        "Salesforce/blip2-flan-t5-xl",
-        "Salesforce/blip2-flan-t5-xxl",
-        # Additional captioning models
-        "google/pix2struct-docvqa-large",
-        "google/pix2struct-ai2d-large",
-        "google/pix2struct-textcaps-large",
-        "google/pix2struct-ocrvqa-large",
-        # VQA models
-        "dandelin/vilt-b32-finetuned-vqa",
-        "google/pix2struct-ai2d-large",
-        # Zero-shot classification
-        "openai/clip-vit-large-patch14-336",
-        "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
-        # More diverse
-        "microsoft/git-base-textcaps",
-        "microsoft/git-large-textcaps",
-        "microsoft/git-large-r",
-        "flax-community/clip-rsicd-v2",
+        "microsoft/Florence-2-large",
+        "Salesforce/blip-image-captioning-base",
     ]
 
-    # ---------- OpenRouter (dynamic list from manager, but we also keep a hardcoded fallback) ----------
+    # ---------- OpenRouter (free vision models – verified) ----------
     OPENROUTER_VISION_MODELS = [
         "meta-llama/llama-3.2-11b-vision-instruct:free",
         "google/gemini-flash-1.5:free",
-        "google/gemini-pro-1.5:free",
         "qwen/qwen-2-vl-7b-instruct:free",
         "openai/gpt-4o-mini:free",
         "mistral/pixtral-12b:free",
@@ -199,6 +175,27 @@ class Config:
     MODEL_FAILURE_BLACKLIST_TTL_SECONDS = 300
     HEALTH_CHECK_INTERVAL_SECONDS = 60
     ENABLE_PARALLEL_MODEL_TESTING = True
+
+    # ============================================================
+    # NEW: NETWORK RETRY CONFIGURATION
+    # ============================================================
+    NETWORK_RETRY_MAX_ATTEMPTS = 3
+    NETWORK_RETRY_BASE_DELAY = 0.5
+    NETWORK_RETRY_MAX_DELAY = 10.0
+    NETWORK_RETRY_JITTER = 0.1
+
+    # ============================================================
+    # TIMEOUT & FEEDBACK CONFIGURATION
+    # ============================================================
+    TEXT_SEARCH_TIMEOUT_SECONDS = 5
+    VISION_SEARCH_TIMEOUT_SECONDS = 10
+    VOICE_SEARCH_TIMEOUT_SECONDS = 8
+    GLOBAL_RESTART_TIMEOUT_SECONDS = 15
+
+    # ============================================================
+    # IMAGE GENERATION SPECIFIC
+    # ============================================================
+    POLLINATIONS_MAX_PROMPT_LENGTH = 2000  # Max prompt length for Pollinations (URL limit)
 
     MAX_TOKENS = 1500
     TEMPERATURE = 0.7

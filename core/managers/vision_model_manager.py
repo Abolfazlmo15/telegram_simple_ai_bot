@@ -1,10 +1,11 @@
-"""Dynamic manager for vision-capable models – filters only free models."""
+"""Dynamic manager for vision-capable models – filters only free models, uses proxy."""
 import logging
 import threading
 import time
 import httpx
 from typing import List, Optional
 from core.config import Config
+from core.managers.proxy_manager import ProxyManager
 
 logger = logging.getLogger(__name__)
 
@@ -14,27 +15,34 @@ class VisionModelManager:
     Manages available vision-capable models from OpenRouter.
     Auto-updates every 10 minutes with live model availability.
     Filters only free models (those with ':free' suffix or in the known free list).
+    Uses the proxy from ProxyManager if available.
     """
 
-    def __init__(self):
+    def __init__(self, proxy_manager: Optional[ProxyManager] = None):
         self.available_models: List[str] = []
         self.is_running = False
         self.update_interval = 600  # 10 minutes
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self.proxy_manager = proxy_manager
 
-        # Expanded list of known free vision models (verified on OpenRouter)
+        # Expanded list of known free vision models (verified manually)
         self.known_vision_models = [
+            "google/gemini-2.0-flash-exp:free",
             "meta-llama/llama-3.2-11b-vision-instruct:free",
-            "meta-llama/llama-3.2-90b-vision-instruct:free",
             "qwen/qwen-2-vl-7b-instruct:free",
             "qwen/qwen-2-vl-72b-instruct:free",
             "google/gemini-flash-1.5:free",
             "google/gemini-pro-1.5:free",
             "openai/gpt-4o-mini:free",
-            "mistral/pixtral-12b:free"
+            "mistral/pixtral-12b:free",
+            "llava-hf/llava-1.5-7b-hf:free",
+            "llava-hf/llava-1.5-13b-hf:free",
+            "HuggingFaceM4/idefics2-8b:free",
         ]
-        logger.info("🔷 VisionModelManager initialized (free models only)")
+        self._last_fetch_time = 0
+        self._fetch_lock = threading.Lock()
+        logger.info("🔷 VisionModelManager initialized (free models only, with proxy)")
 
     def start(self):
         """Start the background model checker."""
@@ -60,6 +68,15 @@ class VisionModelManager:
             if self.is_running:
                 self._fetch_and_update_models()
 
+    def _get_client(self) -> httpx.Client:
+        """Create an HTTP client with proxy if available."""
+        client_kwargs = {"timeout": 15.0}
+        if self.proxy_manager:
+            proxy_url = self.proxy_manager.get_proxy()
+            if proxy_url:
+                client_kwargs["proxy"] = proxy_url
+        return httpx.Client(**client_kwargs)
+
     def _fetch_and_update_models(self):
         """Fetch available vision models from OpenRouter, keeping only free ones."""
         try:
@@ -67,7 +84,7 @@ class VisionModelManager:
                 "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
                 "Content-Type": "application/json"
             }
-            with httpx.Client(timeout=15.0) as client:
+            with self._get_client() as client:
                 resp = client.get("https://openrouter.ai/api/v1/models", headers=headers)
                 resp.raise_for_status()
                 data = resp.json()
@@ -81,26 +98,22 @@ class VisionModelManager:
                 for model in all_models:
                     model_id = model.get("id", "")
                     model_id_lower = model_id.lower()
-                    # Check if it's a vision model and if it's free (':free' suffix)
+                    # Check if it is vision-capable and free
                     if any(kw in model_id_lower for kw in vision_keywords):
                         if ":free" in model_id_lower:
                             vision_models.append(model_id)
                         else:
-                            # Also check if this model is in our known free list
+                            # If it's in our known list, include even without :free
                             if model_id in self.known_vision_models:
                                 vision_models.append(model_id)
 
-                # Ensure all known free models are included
+                # Ensure known models are present (some may not be detected)
                 for known in self.known_vision_models:
                     if known not in vision_models:
-                        # Check if the base model exists (e.g., without ':free' suffix)
-                        # but we only want the free version, so we just add it anyway
-                        # because we know it's available on OpenRouter.
                         vision_models.append(known)
 
                 with self._lock:
                     if vision_models:
-                        # Remove duplicates while preserving order
                         seen = set()
                         unique = []
                         for m in vision_models:
@@ -110,9 +123,9 @@ class VisionModelManager:
                         self.available_models = unique
                         logger.info(f"Vision models updated: {len(self.available_models)} free models available")
                     else:
-                        # Fallback to known free list
                         self.available_models = self.known_vision_models.copy()
                         logger.warning("No free vision models detected, using known fallback models")
+                self._last_fetch_time = time.time()
 
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 402:
@@ -128,7 +141,17 @@ class VisionModelManager:
                 if not self.available_models:
                     self.available_models = self.known_vision_models.copy()
 
-    def get_available_models(self) -> List[str]:
-        """Get list of available vision models (free only)."""
+    def get_available_models(self, force_refresh: bool = False) -> List[str]:
+        """
+        Get list of available vision models (free only).
+        If force_refresh is True, fetch fresh models from OpenRouter.
+        """
+        if force_refresh:
+            logger.info("🔄 Force refreshing vision models from OpenRouter")
+            self._fetch_and_update_models()
         with self._lock:
             return self.available_models.copy() if self.available_models else self.known_vision_models.copy()
+
+    def get_last_fetch_time(self) -> float:
+        """Get timestamp of last successful model fetch."""
+        return self._last_fetch_time

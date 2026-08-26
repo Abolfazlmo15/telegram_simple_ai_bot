@@ -2,6 +2,7 @@
 Core prompt refinement logic for image generation.
 Refines user prompts to be more specific and detailed for image generation models.
 Preserves ALL user-specific details while adding professional enhancements.
+Ensures the refined prompt is clean and does NOT contain the LLM's thinking process.
 """
 import logging
 from typing import Dict, Any, Optional, List
@@ -22,10 +23,11 @@ class PromptRefiner(BaseRefiner):
 
     Features:
     - Preserves ALL user-specific details (NEVER changes what the user said)
-    - Only adds detail where the prompt is vague
+    - ONLY adds detail where the prompt is vague
     - Detects and preserves style preferences
     - NO filtering or censorship
     - Multiple refinement levels (basic, advanced, LLM-based)
+    - Post-processing to strip the LLM's thinking process
     """
 
     def __init__(self, user_data_manager: Optional[UserDataManager] = None,
@@ -37,6 +39,15 @@ class PromptRefiner(BaseRefiner):
         self.template_manager = TemplateManager()
         self._cache = {}
         self._refinement_level = "advanced"  # basic, advanced, llm
+
+        # Phrases that indicate the LLM output is its reasoning, not the prompt
+        self.thinking_phrases = [
+            "thinking process", "analyze user input", "identify what needs keeping",
+            "rules summary", "core request", "constraints", "output only",
+            "here's a thinking process", "let me think", "step 1", "step 2",
+            "1.", "2.", "3.", "analyze", "refine", "preserve", "enhance"
+        ]
+
         logger.info("🔧 PromptRefiner initialized")
 
     async def refine(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
@@ -72,7 +83,11 @@ class PromptRefiner(BaseRefiner):
         if self.text_engine and self.text_engine.is_initialized:
             refined = await self._refine_with_llm(prompt, context)
             if refined:
-                return refined
+                # Post-process: strip thinking process if present
+                cleaned = self._clean_refined_prompt(refined)
+                if cleaned and cleaned != refined:
+                    logger.info(f"🧹 Cleaned thinking process from refined prompt")
+                return cleaned if cleaned else prompt
 
         # Step 5: Fallback to basic refinement
         return self._refine_basic(prompt, style_info)
@@ -111,7 +126,8 @@ class PromptRefiner(BaseRefiner):
         return True
 
     async def _refine_with_llm(self, prompt: str, context: Optional[Dict]) -> Optional[str]:
-        """Refine the prompt using the LLM."""
+        """Refine the prompt using the LLM with a strict instruction to output only the refined prompt."""
+        # Strict instruction to force the LLM to output ONLY the refined prompt
         refinement_prompt = f"""You are an expert prompt engineer for image generation.
 
 The user has provided a prompt: "{prompt}"
@@ -127,9 +143,11 @@ CRITICAL RULES:
 3. DO NOT filter, censor, or remove ANYTHING. The user has complete freedom.
 4. Add reasonable enhancements for clarity: describe mood, lighting, composition, quality.
 5. Keep the refined prompt clear, concise, and directly usable for image generation.
-6. Output ONLY the refined prompt text - no explanation, no markdown, no quotes around it.
 
-The refined prompt should be a single, clear sentence or paragraph."""
+IMPORTANT: Output ONLY the refined prompt text. NO explanation, NO thinking process, NO markdown, NO quotes around it.
+The refined prompt must be a single, clear sentence or paragraph starting with the original core request.
+Do NOT include any phrases like "Here's a thinking process", "Analyze user input", "Step 1", etc.
+Just output the refined prompt text and nothing else."""
 
         try:
             response, _, _ = await self.text_engine.process(
@@ -144,14 +162,63 @@ The refined prompt should be a single, clear sentence or paragraph."""
             # Remove any markdown artifacts
             refined = refined.replace('```', '').strip()
 
-            if refined and len(refined) > 5:
-                logger.info(f"✅ LLM refinement successful: {refined[:50]}...")
-                return refined
+            # If the response is empty or too short, return None
+            if not refined or len(refined) < 5:
+                logger.warning("LLM returned empty or too short response")
+                return None
 
-            return None
+            logger.info(f"✅ LLM refinement successful: {refined[:50]}...")
+            return refined
+
         except Exception as e:
             logger.error(f"❌ LLM refinement failed: {e}")
             return None
+
+    def _clean_refined_prompt(self, refined: str) -> str:
+        """
+        Post-process the refined prompt to remove any thinking process content.
+        If the prompt looks like a thinking process, try to extract the actual prompt.
+        """
+        # Check if it contains thinking process phrases
+        lower = refined.lower()
+        contains_thinking = any(phrase in lower for phrase in self.thinking_phrases)
+
+        if not contains_thinking:
+            return refined
+
+        logger.warning("Refined prompt contains thinking process phrases, attempting to clean")
+
+        # Try to find the actual prompt: look for sentences after common markers
+        # Often the thinking process ends with "Refined prompt:" or similar
+        markers = [
+            "refined prompt:", "final prompt:", "output:", "here is the refined prompt:",
+            "refined: ", "prompt: ", "final refined prompt:"
+        ]
+        for marker in markers:
+            if marker in refined.lower():
+                parts = refined.lower().split(marker, 1)
+                if len(parts) > 1:
+                    extracted = parts[1].strip()
+                    if extracted and len(extracted) > 10:
+                        logger.info(f"Extracted prompt after marker '{marker}': {extracted[:50]}...")
+                        return extracted
+
+        # If no marker, try to find the first sentence that looks like a prompt
+        # Look for the first sentence that is not an instruction
+        lines = refined.split('\n')
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            # Skip lines that are clearly part of the thinking process
+            if any(phrase in line.lower() for phrase in ["step", "analyze", "identify", "constraints", "rules"]):
+                continue
+            # If the line is long enough and doesn't contain thinking indicators, use it
+            if len(line) > 20:
+                return line
+
+        # If all else fails, return the original refined (maybe it wasn't that bad)
+        return refined
 
     def _refine_basic(self, prompt: str, style_info: Dict[str, Any]) -> str:
         """

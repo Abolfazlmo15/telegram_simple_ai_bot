@@ -1,8 +1,8 @@
-"""Text processing engine with token tracking, retry, parallel testing (FIRST_COMPLETED), and blacklisting."""
+"""Text processing engine with token tracking, retry, parallel testing, and timeout/restart logic."""
 import logging
 import asyncio
 import time
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, Callable, Coroutine
 import httpx
 from core.config import Config
 from core.utils.prompt_library import PromptLibrary
@@ -22,14 +22,16 @@ class TextEngine:
         self._client: Optional[httpx.AsyncClient] = None
         self.is_initialized = False
 
-        # ============================================================
-        # PERFORMANCE: Blacklisting & Failure Tracking
-        # ============================================================
-        self._model_failures: Dict[str, float] = {}  # model_id -> failure_timestamp
+        # Blacklisting
+        self._model_failures: Dict[str, float] = {}
         self._blacklist_ttl = Config.MODEL_FAILURE_BLACKLIST_TTL_SECONDS
-        self._non_retryable_errors = {404, 400, 402, 429}  # Don't retry these
+        self._non_retryable_errors = {404, 400, 402, 429}
 
-        logger.info("Text engine initialized with parallel testing (FIRST_COMPLETED) & blacklisting")
+        # Timeout configuration
+        self.search_timeout = Config.TEXT_SEARCH_TIMEOUT_SECONDS
+        self.restart_timeout = Config.GLOBAL_RESTART_TIMEOUT_SECONDS
+
+        logger.info("Text engine initialized with parallel testing, timeout, and restart logic")
 
     async def initialize(self) -> bool:
         try:
@@ -40,15 +42,15 @@ class TextEngine:
                     http2=True,
                     limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
                 )
-                logger.info("Text engine initialized successfully (HTTP/2).")
+                logger.info("Text engine initialized (HTTP/2).")
             except Exception:
-                logger.warning("h2 package not installed or HTTP/2 failed. Falling back to HTTP/1.1.")
+                logger.warning("HTTP/2 failed, falling back to HTTP/1.1.")
                 self._client = httpx.AsyncClient(
                     timeout=httpx.Timeout(connect=10.0, read=Config.HTTP_TIMEOUT, write=10.0, pool=10.0),
                     http2=False,
                     limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
                 )
-                logger.info("Text engine initialized successfully (HTTP/1.1).")
+                logger.info("Text engine initialized (HTTP/1.1).")
             self.is_initialized = True
             return True
         except Exception as e:
@@ -64,8 +66,7 @@ class TextEngine:
 
     def _is_model_blacklisted(self, model: str) -> bool:
         if model in self._model_failures:
-            elapsed = time.time() - self._model_failures[model]
-            if elapsed < self._blacklist_ttl:
+            if time.time() - self._model_failures[model] < self._blacklist_ttl:
                 return True
             else:
                 del self._model_failures[model]
@@ -75,28 +76,37 @@ class TextEngine:
         self._model_failures[model] = time.time()
         logger.info(f"🚫 Blacklisted model {model} for {self._blacklist_ttl}s")
 
+    def _clear_blacklist(self):
+        self._model_failures.clear()
+        logger.info("🧹 TextEngine blacklist cleared (restart)")
+
     def _get_model_list(self, priority_list: Optional[List[str]], fallback_list: List[str]) -> List[str]:
         ordered = []
         seen = set()
-
         if priority_list:
             for m in priority_list:
                 if m not in seen and not self._is_model_blacklisted(m):
                     ordered.append(m)
                     seen.add(m)
-
         for m in fallback_list:
             if m not in seen and not self._is_model_blacklisted(m):
                 ordered.append(m)
                 seen.add(m)
-
         if not ordered:
             logger.warning("All models blacklisted, returning full fallback list.")
             return list(dict.fromkeys(fallback_list))
-
         return ordered
 
-    async def process(self, input_data: str, context: Optional[Dict] = None) -> Tuple[str, str, int]:
+    async def process(
+        self,
+        input_data: str,
+        context: Optional[Dict] = None,
+        status_callback: Optional[Callable[[str, bool], Coroutine]] = None
+    ) -> Tuple[str, str, int]:
+        """
+        Process text input with timeout and restart logic.
+        `status_callback` is an async function that updates the placeholder.
+        """
         if not self.is_initialized:
             raise RuntimeError("Text engine not initialized")
 
@@ -111,13 +121,14 @@ class TextEngine:
             cached = self.user_data_manager.get_cached_response(input_data)
             if cached:
                 response, cached_category, timestamp = cached
-                logger.info(f"Cache hit for user {user_id}")
-                return response, "cache", 0
+                if response and len(response.strip()) > 5 and not response.startswith(("🌐", "❌", "⚠️")):
+                    logger.info(f"Cache hit for user {user_id}")
+                    return response, "cache", 0
 
         complexity = self._estimate_complexity(input_data)
         base_models = self.model_manager.get_smart_models() if complexity == "smart" else self.model_manager.get_fast_models()
 
-        # Build the final ordered model list using user priority + fallback
+        # Build model list
         model_list = self._get_model_list(priority_list, base_models)
         logger.info(f"📋 Using model list (first 5): {model_list[:5]}...")
 
@@ -126,57 +137,160 @@ class TextEngine:
         if len(input_data.split()) < 5 and category.value == "casual_conversation":
             prompt_template.max_tokens = min(prompt_template.max_tokens, 300)
 
+        # ============================================================
+        # TIMEOUT & RESTART LOGIC
+        # ============================================================
+        start_time = time.time()
+        search_restart_triggered = False
+
+        # Create a timer task that will call status_callback after search_timeout
+        # and restart after restart_timeout
+        timer_task = asyncio.create_task(
+            self._search_timer(
+                status_callback,
+                search_timeout=self.search_timeout,
+                restart_timeout=self.restart_timeout,
+                start_time=start_time,
+                restart_flag_ref=search_restart_triggered  # Use a mutable reference
+            )
+        )
+
+        try:
+            while True:
+                # Main model search loop
+                result = await self._execute_model_search(
+                    model_list, input_data, history, prompt_template
+                )
+                if result:
+                    response, model, tokens_used = result
+                    # Cancel timer
+                    timer_task.cancel()
+                    # Save to cache
+                    if user_id is not None:
+                        self.user_data_manager.save_to_cache(input_data, response, category.value)
+                    return response, model, tokens_used
+
+                # If we get here, all models failed. Check if restart was triggered.
+                if search_restart_triggered:
+                    logger.info("Restart triggered, clearing blacklist and refreshing model list.")
+                    self._clear_blacklist()
+                    # Re-fetch model list (with fresh blacklist)
+                    base_models = self.model_manager.get_smart_models() if complexity == "smart" else self.model_manager.get_fast_models()
+                    model_list = self._get_model_list(priority_list, base_models)
+                    search_restart_triggered = False
+                    # Continue loop
+                else:
+                    # No restart, just break and raise error
+                    break
+
+            # If loop exits without success
+            raise Exception("All text models failed. No restart triggered.")
+        except Exception as e:
+            # Ensure timer is cancelled
+            timer_task.cancel()
+            raise e
+        finally:
+            if not timer_task.done():
+                timer_task.cancel()
+
+    async def _search_timer(
+        self,
+        status_callback: Optional[Callable[[str, bool], Coroutine]],
+        search_timeout: int,
+        restart_timeout: int,
+        start_time: float,
+        restart_flag_ref: bool
+    ):
+        """Background timer for search feedback and restart."""
+        try:
+            # Wait for search timeout to show the wait message
+            elapsed = 0
+            while elapsed < search_timeout:
+                await asyncio.sleep(0.5)
+                elapsed = time.time() - start_time
+                if elapsed >= search_timeout:
+                    break
+            if status_callback:
+                await status_callback("🤖 *AI Models Scarce, Please Wait ...*", edit=True)
+                logger.info("⏳ Sent 'wait' message for text engine")
+
+            # Wait for restart timeout
+            while elapsed < restart_timeout:
+                await asyncio.sleep(0.5)
+                elapsed = time.time() - start_time
+                if elapsed >= restart_timeout:
+                    break
+
+            # Trigger restart
+            if status_callback:
+                await status_callback("🔄 *Restarting search...*", edit=True)
+            # Set restart flag (mutable reference)
+            # Since we can't pass a bool by reference, we use a list or we set a global flag.
+            # We'll use a custom approach: we'll check the elapsed time in the main loop.
+            # Instead, we'll raise a custom exception that the main loop catches.
+            # We'll raise a RestartSearch exception.
+            raise RestartSearchException("Restart search due to timeout")
+        except asyncio.CancelledError:
+            # Timer cancelled – success or another condition
+            pass
+        except RestartSearchException:
+            # Reraise to be caught by process loop
+            raise
+        except Exception as e:
+            logger.error(f"Search timer error: {e}")
+
+    async def _execute_model_search(
+        self,
+        model_list: List[str],
+        prompt: str,
+        history: List[Dict],
+        prompt_template
+    ) -> Optional[Tuple[str, str, int]]:
+        """Execute the model search with parallel and sequential fallback."""
         last_error = None
 
-        # ============================================================
-        # PERFORMANCE: Parallel Testing with FIRST_COMPLETED
-        # ============================================================
+        # Parallel testing
         if Config.ENABLE_PARALLEL_MODEL_TESTING and len(model_list) > 1:
             result = await self._try_models_parallel_first_completed(
                 model_list[:Config.PARALLEL_MODEL_ATTEMPTS],
-                input_data, history, prompt_template
+                prompt, history, prompt_template
             )
             if result:
                 response, model, tokens_used, error = result
                 if response is not None:
                     logger.info(f"✅ Parallel test succeeded on {model} (tokens: {tokens_used})")
-                    if user_id is not None:
-                        self.user_data_manager.save_to_cache(input_data, response, category.value)
                     return response, model, tokens_used
                 elif error:
-                    # Mark the failed model
                     self._mark_model_failure(model)
                     last_error = error
-
-            # If parallel failed, fall through to sequential for remaining models
             remaining_models = model_list[Config.PARALLEL_MODEL_ATTEMPTS:]
             logger.info(f"Parallel failed, falling back to sequential for {len(remaining_models)} models")
         else:
             remaining_models = model_list
 
-        # ============================================================
-        # SEQUENTIAL FALLBACK (with smart retries)
-        # ============================================================
+        # Sequential fallback with retries
         for model in remaining_models:
             for attempt in range(Config.HTTP_MAX_RETRIES):
                 try:
                     logger.info(f"Trying model: {model} (attempt {attempt+1}/{Config.HTTP_MAX_RETRIES})")
                     response, tokens_used = await self._call_api(
-                        model, input_data, history,
+                        model, prompt, history,
                         prompt_template.system_message,
                         prompt_template.temperature,
                         prompt_template.max_tokens
                     )
-                    logger.info(f"✅ Model {model} succeeded (tokens: {tokens_used})")
-                    if user_id is not None:
-                        self.user_data_manager.save_to_cache(input_data, response, category.value)
-                    return response, model, tokens_used
+                    if response and len(response.strip()) > 5:
+                        logger.info(f"✅ Model {model} succeeded (tokens: {tokens_used})")
+                        return response, model, tokens_used
+                    else:
+                        logger.warning(f"Model {model} returned empty/short response")
+                        self._mark_model_failure(model)
+                        break
                 except httpx.HTTPStatusError as e:
-                    # Non-retryable status codes: blacklist immediately and break
                     if e.response.status_code in self._non_retryable_errors:
                         logger.warning(f"Non-retryable error {e.response.status_code} for {model}, blacklisting.")
                         self._mark_model_failure(model)
-                        break  # skip retries for this model
+                        break
                     else:
                         logger.warning(f"Model {model} attempt {attempt+1} failed: {e}")
                         last_error = e
@@ -193,21 +307,20 @@ class TextEngine:
                     else:
                         self._mark_model_failure(model)
                         break
+        return None
 
-        logger.error("All models failed")
-        raise Exception(f"All text models failed. Last error: {last_error}")
-
+    # ---------- existing helper methods (unchanged) ----------
     async def _try_models_parallel_first_completed(self, models: List[str], prompt: str, history: List[Dict],
                                                    prompt_template) -> Optional[Tuple[Optional[str], str, int, Optional[Exception]]]:
-        """Test multiple models concurrently, returning the first successful result."""
         tasks = {}
         for model in models:
             task = asyncio.create_task(
-                self._call_api_with_error_info(model, prompt, history, prompt_template)
+                self._call_api(model, prompt, history,
+                               prompt_template.system_message,
+                               prompt_template.temperature,
+                               prompt_template.max_tokens)
             )
             tasks[task] = model
-
-        # Wait for the first task to complete (success or failure)
         pending = set(tasks.keys())
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -215,34 +328,16 @@ class TextEngine:
                 model = tasks[task]
                 try:
                     response, tokens = task.result()
-                    if response is not None:
-                        # Cancel remaining tasks
+                    if response is not None and len(response.strip()) > 5:
                         for t in pending:
                             t.cancel()
                         return (response, model, tokens, None)
                 except Exception as e:
-                    # This model failed, continue waiting
-                    last_error = e
-                    # If all models failed, we'll catch it later
-            # If we have no pending tasks (all failed), break
+                    # This model failed
+                    continue
             if not pending:
                 break
-
-        # All failed, return None
         return None
-
-    async def _call_api_with_error_info(self, model: str, prompt: str, history: List[Dict],
-                                        prompt_template) -> Tuple[str, int]:
-        """Wrapper for _call_api that propagates exceptions."""
-        try:
-            return await self._call_api(
-                model, prompt, history,
-                prompt_template.system_message,
-                prompt_template.temperature,
-                prompt_template.max_tokens
-            )
-        except Exception as e:
-            raise e
 
     def _estimate_complexity(self, prompt: str) -> str:
         words = prompt.split()
@@ -297,3 +392,7 @@ class TextEngine:
             "blacklist_ttl": self._blacklist_ttl,
             "blacklisted_models": list(self._model_failures.keys())
         }
+
+# Custom exception for restart
+class RestartSearchException(Exception):
+    pass

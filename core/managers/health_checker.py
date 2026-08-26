@@ -6,6 +6,7 @@ skip unhealthy endpoints before they cause request failures.
 import logging
 import threading
 import time
+import random
 import httpx
 from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
@@ -13,6 +14,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from core.config import Config
+from core.utils.network import retry_sync, is_retryable_exception
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +64,10 @@ class HealthChecker:
         self.failure_threshold = 3
         self.success_threshold = 2
         self.cooldown_seconds = Config.MODEL_FAILURE_BLACKLIST_TTL_SECONDS
+
+        # Retry settings for individual health checks
+        self.health_check_retries = 2
+        self.health_check_timeout = 10.0
 
         logger.info(f"🏥 HealthChecker initialized (interval: {self.check_interval_seconds}s)")
 
@@ -142,7 +148,10 @@ class HealthChecker:
             except Exception as e:
                 logger.error(f"🏥 Health check error: {e}", exc_info=True)
 
-            for _ in range(self.check_interval_seconds):
+            # Sleep with small random jitter to avoid thundering herd
+            sleep_time = self.check_interval_seconds + random.uniform(-2, 2)
+            sleep_time = max(10, sleep_time)
+            for _ in range(int(sleep_time)):
                 if not self._is_running:
                     break
                 time.sleep(1)
@@ -154,7 +163,7 @@ class HealthChecker:
 
         for model_id, health in models_to_check:
             try:
-                status, latency, reason = self._check_model(model_id)
+                status, latency, reason = self._check_model_with_retry(model_id)
                 health.checked_count += 1
                 health.last_checked = datetime.now()
                 health.response_time_ms = latency
@@ -173,6 +182,8 @@ class HealthChecker:
                     health.failure_reason = reason or "Unknown failure"
                     if health.consecutive_failures >= self.failure_threshold:
                         health.status = HealthStatus.UNHEALTHY
+                        # If a model becomes unhealthy, we can log and optionally extend blacklist
+                        logger.warning(f"🏥 Model {model_id} marked UNHEALTHY after {health.consecutive_failures} failures")
 
             except Exception as e:
                 logger.warning(f"🏥 Health check failed for {model_id}: {e}")
@@ -185,6 +196,19 @@ class HealthChecker:
                         health.failure_reason = str(e)
                         if health.consecutive_failures >= self.failure_threshold:
                             health.status = HealthStatus.UNHEALTHY
+
+    def _check_model_with_retry(self, model_id: str) -> Tuple[HealthStatus, float, str]:
+        """Check a model with built‑in retry for transient errors."""
+        last_error = None
+        for attempt in range(self.health_check_retries):
+            try:
+                return self._check_model(model_id)
+            except Exception as e:
+                last_error = e
+                if attempt < self.health_check_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+        return HealthStatus.UNHEALTHY, 0.0, str(last_error)
 
     def _check_model(self, model_id: str) -> Tuple[HealthStatus, float, str]:
         # Provider endpoints
@@ -206,7 +230,7 @@ class HealthChecker:
             start = time.time()
             resp = self._client.get(
                 "https://openrouter.ai/api/v1/models",
-                timeout=10.0,
+                timeout=self.health_check_timeout,
                 headers={"Authorization": f"Bearer {Config.OPENROUTER_API_KEY}"}
             )
             latency = (time.time() - start) * 1000
@@ -224,7 +248,7 @@ class HealthChecker:
             start = time.time()
             resp = self._client.get(
                 "https://image.pollinations.ai/prompt/health_test",
-                timeout=10.0,
+                timeout=self.health_check_timeout,
                 params={"width": 64, "height": 64}
             )
             latency = (time.time() - start) * 1000
@@ -235,14 +259,13 @@ class HealthChecker:
             return HealthStatus.UNHEALTHY, 0.0, str(e)
 
     def _check_huggingface(self) -> Tuple[HealthStatus, float, str]:
-        # Use HUGGINGFACE_TOKEN (fixed)
         if not Config.HUGGINGFACE_TOKEN:
             return HealthStatus.UNHEALTHY, 0.0, "No token configured"
         try:
             start = time.time()
             resp = self._client.get(
                 "https://api-inference.huggingface.co/models",
-                timeout=10.0,
+                timeout=self.health_check_timeout,
                 headers={"Authorization": f"Bearer {Config.HUGGINGFACE_TOKEN}"}
             )
             latency = (time.time() - start) * 1000
@@ -257,7 +280,7 @@ class HealthChecker:
             start = time.time()
             resp = self._client.get(
                 "https://openrouter.ai/api/v1/models",
-                timeout=10.0,
+                timeout=self.health_check_timeout,
                 headers={"Authorization": f"Bearer {Config.OPENROUTER_API_KEY}"}
             )
             latency = (time.time() - start) * 1000

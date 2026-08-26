@@ -4,11 +4,13 @@ Uses Preferences for user-specific behavior.
 """
 import logging
 import re
-from typing import Dict, Tuple, Optional, Any, Union
+import asyncio
+from typing import Dict, Tuple, Optional, Any, Union, Callable, Coroutine
 from PIL import Image
 from core.config import Config
 from core.managers.user_data_manager import UserDataManager
 from core.managers.preference_manager import PreferenceManager
+from core.managers.proxy_manager import ProxyManager
 
 # Import prompt engineering modules
 from prompt_engineering.detectors import IntentDetector, PromptExtractor, StyleDetector, ContextAnalyzer
@@ -21,8 +23,9 @@ logger = logging.getLogger(__name__)
 
 
 class BaseEngine:
-    def __init__(self, user_data_manager: UserDataManager):
+    def __init__(self, user_data_manager: UserDataManager, proxy_manager: Optional[ProxyManager] = None):
         self.user_data_manager = user_data_manager
+        self.proxy_manager = proxy_manager
         self.text_engine = None
         self.vision_engine = None
         self.voice_engine = None
@@ -51,7 +54,7 @@ class BaseEngine:
         # Set refiner on correction detector for intelligent merging
         self.correction_detector._refiner = self.prompt_refiner
 
-        logger.info("Base Engine (Router) initialized with Prompt Engineering, Conversation State, and Preferences integration")
+        logger.info("Base Engine (Router) initialized with Prompt Engineering, Conversation State, Preferences, and Proxy integration")
 
     async def initialize(self) -> bool:
         try:
@@ -66,12 +69,12 @@ class BaseEngine:
                 logger.error("Failed to initialise text engine")
                 return False
 
-            self.vision_engine = VisionEngine(self.user_data_manager)
+            self.vision_engine = VisionEngine(self.user_data_manager, proxy_manager=self.proxy_manager)
             vision_success = await self.vision_engine.initialize()
             if not vision_success:
                 logger.warning("Vision engine failed to initialise – continuing without it")
 
-            self.voice_engine = VoiceEngine(self.user_data_manager)
+            self.voice_engine = VoiceEngine(self.user_data_manager, proxy_manager=self.proxy_manager)
             voice_success = await self.voice_engine.initialize()
             if not voice_success:
                 logger.warning("Voice (STT) engine failed to initialise – voice messages will be unavailable")
@@ -84,7 +87,7 @@ class BaseEngine:
             if not image_gen_success:
                 logger.warning("Image generation engine failed to initialise")
 
-            self.voice_generation_engine = VoiceGenerationEngine(self.user_data_manager)
+            self.voice_generation_engine = VoiceGenerationEngine(self.user_data_manager, proxy_manager=self.proxy_manager)
             voice_gen_success = await self.voice_generation_engine.initialize()
             if not voice_gen_success:
                 logger.warning("Voice generation engine failed to initialise")
@@ -115,12 +118,33 @@ class BaseEngine:
         self.is_initialized = False
         logger.info("All engines shutdown complete")
 
-    async def process(self, input_data: Any, context: Optional[Dict] = None) -> Tuple[str, str, int]:
+    async def process(
+        self,
+        input_data: Any,
+        context: Optional[Dict] = None,
+        status_callback: Optional[Callable[[str, bool], Coroutine]] = None
+    ) -> Tuple[str, str, int]:
+        """
+        Process input data with optional status callback for timeout/feedback.
+        Supports cancellation via asyncio.CancelledError.
+
+        Args:
+            input_data: Text, bytes (image/audio), or PIL Image.
+            context: Context dict with user_id, history, preferences, etc.
+            status_callback: Async callback function (msg, edit) for updating status messages.
+
+        Returns:
+            Tuple of (response_data, model_used, metadata)
+        """
         if not self.is_initialized:
             raise RuntimeError("Base engine not initialised. Call initialize() first.")
 
+        # Check for cancellation before processing
+        if asyncio.current_task().cancelled():
+            raise asyncio.CancelledError
+
         # ============================================================
-        # FETCH ALL PRIORITIES ONCE AT THE START (FIX)
+        # FETCH ALL PRIORITIES ONCE AT THE START
         # ============================================================
         user_id = context.get('user_id') if context else None
         username = context.get('username') if context else None
@@ -187,7 +211,7 @@ class BaseEngine:
                     await self.conversation_state.record_input(user_id, 'text', text)
 
                 # ============================================================
-                # STEP 3: Analyze intent using the new system
+                # STEP 3: Analyze intent
                 # ============================================================
                 intent_result = await self.intent_detector.detect(
                     text,
@@ -203,7 +227,7 @@ class BaseEngine:
                 extracted_prompt = extract_result.get('extracted_prompt', text)
 
                 # ============================================================
-                # STEP 5: If it's a correction, handle it
+                # STEP 5: Handle correction or refine prompt
                 # ============================================================
                 if is_correction and user_id:
                     correction_type = intent_result.get('correction_type', 'unknown')
@@ -222,20 +246,23 @@ class BaseEngine:
                     else:
                         refined_prompt = extracted_prompt
                 else:
-                    # ============================================================
-                    # STEP 6: Refine the prompt (with preference awareness)
-                    # ============================================================
                     if intent == 'image_generation':
+                        # Refine prompt – ensure we get a clean prompt, not the thinking process
                         refined_prompt = await self.prompt_refiner.refine(
                             extracted_prompt,
                             context={'user_id': user_id, 'history': history, 'preferences': preferences}
                         )
+                        # If the refined prompt is suspiciously long or contains "thinking process",
+                        # fallback to the original prompt
+                        if len(refined_prompt) > 3000 or "thinking" in refined_prompt.lower()[:200]:
+                            logger.warning("Refined prompt seems to contain thinking process, using original prompt.")
+                            refined_prompt = extracted_prompt
                         logger.info(f"📝 Refined prompt: {refined_prompt[:100]}...")
                     else:
                         refined_prompt = extracted_prompt
 
                 # ============================================================
-                # STEP 7: Determine response mode (preference-aware)
+                # STEP 6: Determine response mode
                 # ============================================================
                 response_mode = ConversationMode.TEXT
                 if user_id:
@@ -256,7 +283,7 @@ class BaseEngine:
                         await self.conversation_state.set_mode(user_id, ConversationMode.VOICE)
 
                 # ============================================================
-                # STEP 8: Route to appropriate engine
+                # STEP 7: Route to appropriate engine (with status_callback)
                 # ============================================================
                 if intent == 'image_generation':
                     logger.info(f"🎨 Detected image generation request")
@@ -294,9 +321,11 @@ class BaseEngine:
                         'preferences': preferences
                     }
 
+                    # Pass status_callback to image generation engine
                     image_bytes, model, size = await self.image_generation_engine.generate(
                         refined_prompt,
-                        context=gen_context
+                        context=gen_context,
+                        status_callback=status_callback
                     )
 
                     if user_id:
@@ -328,9 +357,11 @@ class BaseEngine:
                         'priority_list': voice_gen_priority
                     }
 
+                    # Pass status_callback to voice generation engine
                     audio_bytes, model, size = await self.voice_generation_engine.generate(
                         voice_text,
-                        context=gen_context
+                        context=gen_context,
+                        status_callback=status_callback
                     )
 
                     if user_id:
@@ -347,7 +378,7 @@ class BaseEngine:
 
                 else:
                     # ============================================================
-                    # STEP 9: Text analysis – preference-aware with ALL priorities
+                    # STEP 8: Text analysis – with status_callback
                     # ============================================================
                     logger.debug(f"Routing to TextEngine (analysis) in {response_mode.value} mode")
 
@@ -360,63 +391,90 @@ class BaseEngine:
                     text_context['custom_instructions'] = custom_instructions
                     text_context['priority_list'] = text_priority
 
-                    response_text, model, tokens = await self.text_engine.process(text, text_context)
+                    # Pass status_callback to text engine
+                    response_text, model, tokens = await self.text_engine.process(
+                        text,
+                        text_context,
+                        status_callback=status_callback
+                    )
 
                     # ============================================================
-                    # STEP 10: Convert to voice if in voice mode (FIX)
+                    # STEP 9: Convert to voice if in voice mode (with validation)
                     # ============================================================
                     if response_mode == ConversationMode.VOICE and self.voice_generation_engine and self.voice_generation_engine.is_initialized:
                         try:
-                            logger.info(f"🔊 Converting text response to voice for user {user_id}")
-                            voice_speed = await self.preference_manager.get_voice_speed(user_id, username) if user_id else 1.0
-                            voice_style = await self.preference_manager.get_voice_style(user_id, username) if user_id else "neutral"
+                            if response_text and len(response_text.strip()) > 5:
+                                logger.info(f"🔊 Converting text response to voice for user {user_id}")
+                                voice_speed = await self.preference_manager.get_voice_speed(user_id, username) if user_id else 1.0
+                                voice_style = await self.preference_manager.get_voice_style(user_id, username) if user_id else "neutral"
 
-                            tts_context = {
-                                'user_id': user_id,
-                                'username': username,
-                                'voice_speed': voice_speed,
-                                'voice_style': voice_style,
-                                'priority_list': voice_gen_priority
-                            }
-                            audio_bytes, voice_model, size = await self.voice_generation_engine.generate(
-                                response_text,
-                                context=tts_context
-                            )
-                            # Return voice, not text
-                            return audio_bytes, f"gen_voice_conversation:{voice_model}", size
+                                tts_context = {
+                                    'user_id': user_id,
+                                    'username': username,
+                                    'voice_speed': voice_speed,
+                                    'voice_style': voice_style,
+                                    'priority_list': voice_gen_priority
+                                }
+                                # Pass status_callback to voice generation
+                                audio_bytes, voice_model, size = await self.voice_generation_engine.generate(
+                                    response_text,
+                                    context=tts_context,
+                                    status_callback=status_callback
+                                )
+                                return audio_bytes, f"gen_voice_conversation:{voice_model}", size
+                            else:
+                                logger.warning(f"Response text is empty or too short, skipping TTS")
+                                return response_text, model, tokens
                         except Exception as e:
                             logger.error(f"❌ Voice conversion failed, falling back to text: {e}")
-                            # Fall back to text if TTS fails
                             return response_text, model, tokens
                     else:
-                        # Return text response
                         return response_text, model, tokens
 
             elif isinstance(input_data, bytes):
                 input_type = context.get('input_type', 'image') if context else 'image'
                 if input_type == 'audio' and self.voice_engine:
                     logger.debug("Routing to VoiceEngine (STT)")
-                    transcription, model, tokens = await self.voice_engine.transcribe(input_data, context)
+                    # Pass status_callback to voice engine transcribe
+                    transcription, model, tokens = await self.voice_engine.transcribe(
+                        input_data,
+                        context,
+                        status_callback=status_callback
+                    )
                     if user_id:
                         await self.conversation_state.record_input(user_id, 'voice', transcription)
                     voice_context = context.copy() if context else {}
                     voice_context['input_type'] = 'voice'
                     voice_context['priority_list'] = voice_priority
-                    return await self.process(transcription, voice_context)
+                    # Recursively process with status_callback
+                    return await self.process(transcription, voice_context, status_callback)
                 else:
                     logger.debug("Routing to VisionEngine (bytes)")
                     context['priority_list'] = vision_priority
-                    return await self.vision_engine.process(input_data, context)
+                    # Pass status_callback to vision engine
+                    return await self.vision_engine.process(
+                        input_data,
+                        context,
+                        status_callback=status_callback
+                    )
 
             elif isinstance(input_data, Image.Image):
                 logger.debug("Routing to VisionEngine (PIL Image)")
                 context['priority_list'] = vision_priority
-                return await self.vision_engine.process(input_data, context)
+                # Pass status_callback to vision engine
+                return await self.vision_engine.process(
+                    input_data,
+                    context,
+                    status_callback=status_callback
+                )
 
             else:
                 logger.warning(f"Unknown input type {type(input_data)}, treating as text")
-                return await self.text_engine.process(str(input_data), context)
+                return await self.text_engine.process(str(input_data), context, status_callback)
 
+        except asyncio.CancelledError:
+            logger.info("BaseEngine.process cancelled, propagating")
+            raise
         except Exception as e:
             logger.error(f"Error in base engine routing: {e}", exc_info=True)
             raise

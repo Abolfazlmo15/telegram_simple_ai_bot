@@ -3,7 +3,7 @@ import json
 import asyncio
 from flask import Flask, request, Response
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from core.config import Config
 from core.engines.base_engine import BaseEngine
 from core.engines.analysis.voice_engine import VoiceEngine
@@ -94,24 +94,37 @@ def init_telegram_app():
         .build()
     )
 
-    # Register handlers
+    # ---------- Register Handlers ----------
+    # Command handlers
     _telegram_app.add_handler(CommandHandler("start", _handlers.start))
     _telegram_app.add_handler(CommandHandler("help", _handlers.help_command))
     _telegram_app.add_handler(CommandHandler("about", _handlers.about))
     _telegram_app.add_handler(CommandHandler("status", _handlers.status))
     _telegram_app.add_handler(CommandHandler("clear", _handlers.clear_history))
+
+    # New consolidated priority and mode commands
+    _telegram_app.add_handler(CommandHandler("prioritize", _handlers.prioritize_command))
+    _telegram_app.add_handler(CommandHandler("mode", _handlers.mode_command))
+
+    # Existing individual priority commands (kept for backward compatibility)
     _telegram_app.add_handler(CommandHandler("text_engine_priority", _handlers.prioritize_text_engine))
     _telegram_app.add_handler(CommandHandler("vision_engine_priority", _handlers.prioritize_vision_engine))
     _telegram_app.add_handler(CommandHandler("voice_engine_priority", _handlers.prioritize_voice_engine))
     _telegram_app.add_handler(CommandHandler("voice_gen_priority", _handlers.prioritize_voice_generation))
     _telegram_app.add_handler(CommandHandler("image_gen_priority", _handlers.prioritize_image_generation_method))
 
+    # Message handlers
     _telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handlers.handle_message))
     _telegram_app.add_handler(MessageHandler(filters.PHOTO, _handlers.handle_photo))
     if voice_ready:
         _telegram_app.add_handler(MessageHandler(filters.VOICE, _handlers.handle_voice))
 
-    print("✅ Bot initialized successfully!")
+    # Callback query handlers
+    _telegram_app.add_handler(CallbackQueryHandler(_handlers.cancel_task, pattern="^cancel_"))
+    _telegram_app.add_handler(CallbackQueryHandler(_handlers.priority_callback, pattern="^prioritize_"))
+    _telegram_app.add_handler(CallbackQueryHandler(_handlers.mode_callback, pattern="^mode_"))
+
+    print("✅ Bot initialized successfully with all handlers (prioritize, mode, cancel)!")
 
 
 @app.route('/webhook', methods=['POST'])

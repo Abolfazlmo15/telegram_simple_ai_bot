@@ -48,6 +48,7 @@ class UserDataManager:
         # ============================================================
         self._priority_cache: Dict[str, Tuple[Optional[List[str]], float]] = {}  # key: f"{user_id}_{engine}" -> (list, timestamp)
         self._pref_cache: Dict[int, Tuple[Dict, float]] = {}  # user_id -> (prefs, timestamp)
+        self._tiers_cache: Optional[Tuple[Dict[str, bool], float]] = None  # cache for get_available_tiers
         self._cache_ttl = 60  # 60 seconds TTL to balance freshness and performance
 
         logger.info(f"User data manager initialized (dir: {self.base_dir}) with TTL caching (TTL: {self._cache_ttl}s)")
@@ -564,6 +565,11 @@ class UserDataManager:
             logger.info(f"Not caching error response: {response[:50]}...")
             return
 
+        # Also reject empty or too-short responses
+        if not response or len(response.strip()) < 5:
+            logger.info("Not caching empty or too-short response")
+            return
+
         normalized = text.strip().lower()
         key = hashlib.md5(normalized.encode('utf-8')).hexdigest()
         self.cache[key] = {
@@ -898,11 +904,19 @@ class UserDataManager:
 
     async def get_available_tiers(self) -> Dict[str, bool]:
         """Get all available image generation tiers and their status."""
-        return {
+        # Use cached value if fresh
+        if self._tiers_cache:
+            tiers, timestamp = self._tiers_cache
+            if time.time() - timestamp < self._cache_ttl:
+                return tiers
+
+        tiers = {
             "pollinations": True,  # Always available
-            "huggingface": bool(Config.HUGGINGFACE_API_KEY),
+            "huggingface": bool(Config.HUGGINGFACE_TOKEN),  # Fixed: use HUGGINGFACE_TOKEN
             "openrouter": bool(Config.OPENROUTER_API_KEY),
         }
+        self._tiers_cache = (tiers, time.time())
+        return tiers
 
     # ---------- RESPONSE MODE (Legacy wrapper) ----------
     async def get_response_mode_legacy(self, user_id: int, username: Optional[str] = None) -> str:

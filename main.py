@@ -3,7 +3,7 @@ import sys
 import logging
 import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 from telegram.error import NetworkError, TimedOut
 from core.config import Config
 from core.engines.base_engine import BaseEngine
@@ -131,7 +131,11 @@ def main() -> None:
     application.add_handler(CommandHandler("status", handlers.status))
     application.add_handler(CommandHandler("clear", handlers.clear_history))
 
-    # Priority commands
+    # New consolidated priority and mode commands
+    application.add_handler(CommandHandler("prioritize", handlers.prioritize_command))
+    application.add_handler(CommandHandler("mode", handlers.mode_command))
+
+    # Existing individual priority commands (kept for backward compatibility)
     application.add_handler(CommandHandler("text_engine_priority", handlers.prioritize_text_engine))
     application.add_handler(CommandHandler("vision_engine_priority", handlers.prioritize_vision_engine))
     application.add_handler(CommandHandler("voice_engine_priority", handlers.prioritize_voice_engine))
@@ -147,6 +151,14 @@ def main() -> None:
         logger.info("✅ Voice handler registered")
     else:
         logger.warning("⚠️ Voice handler NOT registered (engine unavailable)")
+
+    # ============================================================
+    # CALLBACK QUERY HANDLERS
+    # ============================================================
+    application.add_handler(CallbackQueryHandler(handlers.cancel_task, pattern="^cancel_"))
+    application.add_handler(CallbackQueryHandler(handlers.priority_callback, pattern="^prioritize_"))
+    application.add_handler(CallbackQueryHandler(handlers.mode_callback, pattern="^mode_"))
+    logger.info("✅ All callback handlers registered (cancel, prioritize, mode)")
 
     # ---------- Error Handler ----------
     application.add_error_handler(error_handler)
