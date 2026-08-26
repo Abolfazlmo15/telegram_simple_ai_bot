@@ -11,6 +11,8 @@ from core.engines.analysis.voice_engine import VoiceEngine
 from core.managers.rate_limiter import RateLimiter
 from core.managers.user_data_manager import UserDataManager
 from core.managers.proxy_manager import ProxyManager
+from core.managers.health_checker import HealthChecker
+from core.managers.cache_manager import CacheManager
 from core.analytics.analytics_engine import AnalyticsEngine
 from handlers.bot_handlers import BotHandlers
 
@@ -45,33 +47,50 @@ def main() -> None:
 
     # ---------- Core Managers ----------
     user_manager = UserDataManager()
+
+    # ---------- Health Checker ----------
+    health_checker = HealthChecker()
+    health_checker.start()
+    logger.info("✅ Health checker started (background)")
+
+    # ---------- Cache Manager ----------
+    cache_manager = CacheManager(
+        max_size=5000,
+        default_ttl=300,
+        persistence_dir="cache_data"
+    )
+    logger.info("✅ Cache manager initialized")
+
+    # ---------- Analytics Engine ----------
     analytics_engine = AnalyticsEngine()
     if Config.ANALYTICS_ENABLED:
         analytics_engine.start()
         logger.info("✅ Analytics engine started (background)")
 
+    # ---------- Rate Limiter ----------
     rate_limiter = RateLimiter(
         max_requests=Config.RATE_LIMIT_MAX_REQUESTS,
         window_seconds=Config.RATE_LIMIT_WINDOW_SECONDS
     )
 
-    # ---------- Base Engine (Text + Vision) ----------
-    logger.info("🔄 Initializing Base Engine (Text + Vision)...")
+    # ---------- Base Engine (Text + Vision + Voice) ----------
+    logger.info("🔄 Initializing Base Engine (Text + Vision + Voice)...")
     engine = BaseEngine(user_manager)
     engines_ready = asyncio.run(engine.initialize())
     if not engines_ready:
         logger.error("❌ Failed to initialize base engines. Exiting.")
+        health_checker.stop()
+        analytics_engine.stop()
         sys.exit(1)
     logger.info("✅ Base Engine initialized successfully")
 
-    # ---------- Voice Engine ----------
-    logger.info("🔄 Initializing Voice Engine...")
-    voice_engine = VoiceEngine(user_manager)
-    voice_ready = asyncio.run(voice_engine.initialize())
-    if not voice_ready:
-        logger.warning("⚠️ Voice engine failed to initialize – voice messages will be unavailable")
+    # ---------- REUSE the voice engine from BaseEngine (AVOID DOUBLE LOAD) ----------
+    voice_engine = engine.voice_engine
+    voice_ready = voice_engine is not None and voice_engine.is_initialized
+    if voice_ready:
+        logger.info("✅ Voice Engine reused from Base Engine")
     else:
-        logger.info("✅ Voice Engine initialized successfully")
+        logger.warning("⚠️ Voice engine not available – voice messages will be unavailable")
 
     # ---------- Proxy Manager ----------
     proxy_manager = ProxyManager()
@@ -83,7 +102,9 @@ def main() -> None:
         rate_limiter=rate_limiter,
         user_data_manager=user_manager,
         analytics_engine=analytics_engine,
-        proxy_manager=proxy_manager
+        proxy_manager=proxy_manager,
+        health_checker=health_checker,
+        cache_manager=cache_manager
     )
 
     # ---------- Telegram Application ----------
@@ -109,10 +130,13 @@ def main() -> None:
     application.add_handler(CommandHandler("about", handlers.about))
     application.add_handler(CommandHandler("status", handlers.status))
     application.add_handler(CommandHandler("clear", handlers.clear_history))
-    application.add_handler(CommandHandler("prioritize_text_engine", handlers.prioritize_text_engine))
-    application.add_handler(CommandHandler("prioritize_vision_engine", handlers.prioritize_vision_engine))
-    # FIXED: Shortened command name (was 35 chars, now 15)
-    application.add_handler(CommandHandler("image_priority", handlers.prioritize_image_generation_method))
+
+    # Priority commands
+    application.add_handler(CommandHandler("text_engine_priority", handlers.prioritize_text_engine))
+    application.add_handler(CommandHandler("vision_engine_priority", handlers.prioritize_vision_engine))
+    application.add_handler(CommandHandler("voice_engine_priority", handlers.prioritize_voice_engine))
+    application.add_handler(CommandHandler("voice_gen_priority", handlers.prioritize_voice_generation))
+    application.add_handler(CommandHandler("image_gen_priority", handlers.prioritize_image_generation_method))
 
     # ---------- Message Handlers ----------
     logger.info("📋 Registering message handlers...")
@@ -122,7 +146,7 @@ def main() -> None:
         application.add_handler(MessageHandler(filters.VOICE, handlers.handle_voice))
         logger.info("✅ Voice handler registered")
     else:
-        logger.warning("⚠️ Voice handler NOT registered (engine failed)")
+        logger.warning("⚠️ Voice handler NOT registered (engine unavailable)")
 
     # ---------- Error Handler ----------
     application.add_error_handler(error_handler)
@@ -132,6 +156,8 @@ def main() -> None:
     logger.info("✅ Bot is online and waiting for messages!")
     logger.info(f"⚡ Performance: HTTP/2 enabled (with fallback), 10 connection pool")
     logger.info(f"💾 Cache: TTL={Config.CACHE_TTL_SECONDS}s, similarity={Config.CACHE_SIMILARITY_THRESHOLD}")
+    logger.info(f"🏥 Health checker: interval={Config.HEALTH_CHECK_INTERVAL_SECONDS}s")
+    logger.info(f"📦 Cache manager: max_size=5000, default_ttl=300s")
 
     try:
         application.run_polling(
@@ -147,10 +173,19 @@ def main() -> None:
         raise
     finally:
         logger.info("🛑 Shutting down...")
+
+        # Stop background services
         analytics_engine.stop()
+        health_checker.stop()
+
+        # Save cache persistence
+        cache_manager.save_persistence()
+
+        # Shutdown engines
         asyncio.run(engine.shutdown())
-        if voice_ready:
-            asyncio.run(voice_engine.shutdown())
+        # voice_engine is already part of engine, so no separate shutdown needed
+
+        logger.info("✅ Shutdown complete")
 
 
 if __name__ == "__main__":

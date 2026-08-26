@@ -358,3 +358,29 @@ class AnalyticsEngine:
             "avg_response_time": sum(all_response_times) / len(all_response_times) if all_response_times else 0,
             "global_top_topics": sorted(total_topics.items(), key=lambda x: x[1], reverse=True)[:10]
         }
+
+    def clear_cache(self) -> None:
+        """
+        Clear in-memory metrics cache and reset global stats.
+        Does not affect stored analytics files on disk.
+        """
+        self.user_metrics_cache.clear()
+        self.global_stats = {
+            "total_users": 0,
+            "total_messages": 0,
+            "total_api_calls": 0,
+            "average_response_time": 0.0,
+            "error_rate": 0.0,
+            "last_updated": None
+        }
+        logger.info("🧹 AnalyticsEngine cache cleared (metrics reset)")
+
+    def get_info(self) -> Dict[str, any]:
+        """Return information about the analytics engine."""
+        return {
+            "type": "AnalyticsEngine",
+            "running": self.running,
+            "interval_minutes": self.interval_minutes,
+            "cached_users": len(self.user_metrics_cache),
+            "analytics_dir": str(self.analytics_dir)
+        }

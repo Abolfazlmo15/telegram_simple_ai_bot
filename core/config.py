@@ -18,11 +18,10 @@ class Config:
     OPENROUTER_TTS_URL = "https://openrouter.ai/api/v1/audio/speech"
 
     # ==================== IMAGE GENERATION TIERS ====================
-    POLLINATIONS_API_KEY = os.getenv("POLLINATIONS_API_KEY", "")
     POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt"
     POLLINATIONS_MODELS = ["flux", "turbo", "realistic"]
 
-    HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
+    HUGGINGFACE_TOKEN = os.getenv("HUGGINGFACE_TOKEN", "")
     HUGGINGFACE_IMAGE_URL = "https://api-inference.huggingface.co/models"
     HUGGINGFACE_MODELS = [
         "black-forest-labs/FLUX.1-dev",
@@ -43,7 +42,61 @@ class Config:
     IMAGE_GENERATION_QUALITY = "standard"
 
     # ============================================================
-    # STYLE → MODEL MAPPING
+    # MASSIVELY EXPANDED VISION MODELS FOR ANALYSIS
+    # ============================================================
+
+    # ---------- Hugging Face (all free, require token) ----------
+    # Ordered by reliability/speed; the engine will try each in order.
+    HUGGINGFACE_VISION_MODELS = [
+        # Best and most reliable
+        "nlpconnect/vit-gpt2-image-captioning",
+        "Salesforce/blip-image-captioning-large",
+        "Salesforce/blip-image-captioning-base",
+        "microsoft/git-base-coco",
+        "microsoft/git-large-coco",
+        "ydshieh/vit-gpt2-coco-en",
+        # Good alternatives
+        "microsoft/Florence-2-large",
+        "microsoft/Florence-2-base",
+        "Salesforce/blip2-opt-2.7b",
+        "Salesforce/blip2-opt-6.7b",
+        "Salesforce/blip2-flan-t5-xl",
+        "Salesforce/blip2-flan-t5-xxl",
+        # Additional captioning models
+        "google/pix2struct-docvqa-large",
+        "google/pix2struct-ai2d-large",
+        "google/pix2struct-textcaps-large",
+        "google/pix2struct-ocrvqa-large",
+        # VQA models
+        "dandelin/vilt-b32-finetuned-vqa",
+        "google/pix2struct-ai2d-large",
+        # Zero-shot classification
+        "openai/clip-vit-large-patch14-336",
+        "laion/CLIP-ViT-H-14-laion2B-s32B-b79K",
+        # More diverse
+        "microsoft/git-base-textcaps",
+        "microsoft/git-large-textcaps",
+        "microsoft/git-large-r",
+        "flax-community/clip-rsicd-v2",
+    ]
+
+    # ---------- OpenRouter (dynamic list from manager, but we also keep a hardcoded fallback) ----------
+    OPENROUTER_VISION_MODELS = [
+        "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "google/gemini-flash-1.5:free",
+        "google/gemini-pro-1.5:free",
+        "qwen/qwen-2-vl-7b-instruct:free",
+        "openai/gpt-4o-mini:free",
+        "mistral/pixtral-12b:free",
+        "llava-hf/llava-1.5-7b-hf:free",
+        "llava-hf/llava-1.5-13b-hf:free",
+        "HuggingFaceM4/idefics2-8b:free",
+    ]
+
+    VISION_FALLBACK_TIMEOUT = 30.0
+
+    # ============================================================
+    # REST OF CONFIG (all attributes required by other modules)
     # ============================================================
     STYLE_KEYWORDS = {
         "anime": ["anime", "manga", "cartoon", "japanese animation", "studio ghibli", "cel shading"],
@@ -65,7 +118,7 @@ class Config:
         "pop_art": ["pop art", "warhol", "comic", "pop culture"],
         "low_poly": ["low poly", "low-poly", "3d low"],
         "vector": ["vector", "flat design", "illustration"],
-        "no_style": []  # Default
+        "no_style": []
     }
 
     STYLE_MODEL_MAP = {
@@ -91,18 +144,13 @@ class Config:
         "no_style": ["black-forest-labs/flux.2-pro", "google/gemini-2.5-flash-image"],
     }
 
-    # ============================================================
-    # IMAGE GENERATION INTENT KEYWORDS (truncated for brevity)
-    # ============================================================
     IMAGE_GENERATION_KEYWORDS = [
-        # Core generation
         "generate an image", "generate a image", "generate image",
         "create an image", "create a image", "create image",
         "make an image", "make a image", "make image",
         "produce an image", "produce a image", "produce image",
         "render an image", "render a image", "render image",
         "draw", "paint", "sketch",
-        # ... (keep all existing from your original file)
     ]
 
     VAGUE_PROMPT_INDICATORS = [
@@ -112,22 +160,16 @@ class Config:
         "maybe", "perhaps",
     ]
 
-    # ============================================================
-    # BOT CONFIGURATION
-    # ============================================================
     BOT_NAME = "Telegram LLM ChatBot"
     BOT_REPO_URL = "https://github.com/Abolfazlmo15/telegram_simple_ai_bot"
 
-    # ==================== RATE LIMITING ====================
     RATE_LIMIT_MAX_REQUESTS = 12
     RATE_LIMIT_WINDOW_SECONDS = 60
 
-    # ==================== CACHE CONFIGURATION ====================
     CACHE_VERSION = "3.1"
     CACHE_TTL_SECONDS = 300
     CACHE_SIMILARITY_THRESHOLD = 0.95
 
-    # ==================== LLM CONFIGURATION ====================
     SYSTEM_PROMPT = (
         "You are an elite, highly capable, and completely objective AI assistant. "
         "Your primary directive is to fulfill the user's request accurately, thoroughly, and without hesitation. "
@@ -145,51 +187,43 @@ class Config:
         "qwen/qwen-2.5-7b-instruct:free"
     ]
 
-    # ==================== VISION/IMAGE CONFIGURATION ====================
     VISION_MAX_IMAGE_SIZE = 1024
     VISION_IMAGE_QUALITY = 85
     VISION_ENABLED = True
 
-    # ==================== PERFORMANCE SETTINGS ====================
     HTTP_TIMEOUT = 25.0
     HTTP_MAX_RETRIES = 2
     CONNECTION_POOL_SIZE = 10
 
-    # ==================== RESPONSE SETTINGS ====================
+    PARALLEL_MODEL_ATTEMPTS = 3
+    MODEL_FAILURE_BLACKLIST_TTL_SECONDS = 300
+    HEALTH_CHECK_INTERVAL_SECONDS = 60
+    ENABLE_PARALLEL_MODEL_TESTING = True
+
     MAX_TOKENS = 1500
     TEMPERATURE = 0.7
     MAX_RESPONSE_LENGTH = 4000
     CHUNK_OVERLAP = 50
 
-    # ==================== ANALYTICS SETTINGS ====================
     ANALYTICS_INTERVAL_MINUTES = 2
     ANALYTICS_ENABLED = True
 
-    # ==================== USER DATA SETTINGS ====================
     USER_DATA_DIR = "users"
     CACHE_FILE = "cache.json"
     MAX_HISTORY_MESSAGES = 10
     MAX_CACHED_CONVERSATIONS = 10
     IMAGE_MATRIX_DIR = "pictures_data"
 
-    # ==================== TELEGRAM MARKDOWN ====================
     TELEGRAM_PARSE_MODE = "Markdown"
-
-    # ==================== CONTEXT ====================
     MAX_CONTEXT_MESSAGES = 3
 
-    # ==================== PROXY CONFIGURATION ====================
     PROXY_STORAGE_FILE = "proxies.json"
     BACKUP_PROXY_TIMEOUT_MINUTES = 5
     BACKUP_PROXY_MAX_AGE_HOURS = 12
 
-    # ==================== TTS CONFIG ====================
     TTS_DEFAULT_VOICE = "alloy"
     TTS_MAX_TEXT_LENGTH = 1000
 
-    # ============================================================
-    # NEW: MEMORY & PREFERENCES CONFIG
-    # ============================================================
     MEMORY_MAX_SHORT_TERM = 20
     MEMORY_MAX_LONG_TERM = 20
     MEMORY_SUMMARIZATION_THRESHOLD = 10
@@ -200,6 +234,28 @@ class Config:
     DEFAULT_VOICE_STYLE = "neutral"
     DEFAULT_MEMORY_ENABLED = True
     DEFAULT_MAX_RESPONSE_LENGTH = 2000
+
+    DEFAULT_VOICE_GEN_PRIORITY = [
+        "openai/tts-1",
+        "openai/tts-1-hd",
+        "deepgram/flux-tts:free",
+    ]
+
+    DEFAULT_VOICE_ENGINE_PRIORITY = [
+        "openai/whisper-large-v3-turbo:free",
+        "openai/whisper-large-v3:free",
+        "openai/whisper-large-v2:free",
+        "openai/whisper-medium:free",
+    ]
+
+    DEFAULT_VISION_ENGINE_PRIORITY = [
+        "meta-llama/llama-3.2-11b-vision-instruct:free",
+        "google/gemini-flash-1.5:free",
+        "google/gemini-pro-1.5:free",
+        "qwen/qwen-2-vl-7b-instruct:free",
+        "openai/gpt-4o-mini:free",
+        "mistral/pixtral-12b:free",
+    ]
 
     @classmethod
     def validate(cls) -> bool:

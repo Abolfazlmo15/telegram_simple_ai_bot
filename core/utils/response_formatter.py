@@ -1,5 +1,10 @@
+"""
+Handles all aspects of response formatting, chunking, and validation.
+Ensures responses are Telegram-compatible and well-structured.
+"""
 import logging
 from typing import List, Tuple, Optional
+
 from core.utils.response_config import (
     ResponseTemplates, FormattingRules,
     MarkdownStyles, EmojiSet
@@ -159,3 +164,17 @@ class ResponseFormatter:
         """Create a formatted success response"""
         icon = icon or self.emoji.success
         return f"{icon} {message}"
+
+    def clear_cache(self) -> None:
+        """
+        Clear any internal state (stateless utility, no-op).
+        Provided for API consistency with other managers.
+        """
+        pass
+
+    def get_info(self) -> dict:
+        """Return information about the formatter."""
+        return {
+            "type": "ResponseFormatter",
+            "max_chunk_size": FormattingRules.MAX_CHUNK_SIZE
+        }

@@ -1,4 +1,4 @@
-"""Manages primary and backup proxies with persistence and expiry."""
+"""Manages primary and backup proxies with persistence, expiry, and fallback."""
 import json
 import logging
 import time
@@ -17,6 +17,7 @@ class ProxyManager:
     - Backup proxies (only used if primary fails for 5+ minutes)
     - Automatic expiry (proxies older than 12 hours are removed)
     - Persistence across bot restarts (saved to JSON)
+    - **Fallback to default Telegram API if all proxies fail**
     """
 
     def __init__(self, storage_file: str = Config.PROXY_STORAGE_FILE):
@@ -25,6 +26,7 @@ class ProxyManager:
         self.backups: List[Dict[str, any]] = []
         self.primary_fail_start: Optional[float] = None
         self.current_proxy: str = self.primary
+        self._default_fallback = "https://api.telegram.org"  # Always available as last resort
         self._load()
 
         logger.info(f"ProxyManager initialized: primary={self.primary}, backups={len(self.backups)}")
@@ -37,7 +39,6 @@ class ProxyManager:
                     data = json.load(f)
                 self.primary = data.get('primary', self.primary)
                 self.backups = data.get('backups', [])
-                # Remove expired backups (> 12 hours old)
                 self._prune_expired()
                 logger.info(f"Loaded {len(self.backups)} backups from storage")
             except Exception as e:
@@ -86,7 +87,7 @@ class ProxyManager:
     def get_proxy(self) -> str:
         """
         Return the current proxy to use.
-        If primary has been failing for 5+ minutes, switch to a backup.
+        Falls back to default Telegram API if no proxy works.
         """
         # If primary is working or hasn't failed long enough, use primary
         if self.primary_fail_start is None:
@@ -101,27 +102,24 @@ class ProxyManager:
 
         # Primary has failed for 5+ minutes – try a backup
         for backup in self.backups:
-            # Skip if the backup has been used recently (within the same 5-minute window)
             last_used = backup.get('last_used')
             if last_used:
                 last_used_time = datetime.fromisoformat(last_used).timestamp()
                 if time.time() - last_used_time < (Config.BACKUP_PROXY_TIMEOUT_MINUTES * 60):
                     continue
-            # Use this backup
             backup['last_used'] = datetime.now().isoformat()
             self.current_proxy = backup['url']
             self._save()
             logger.info(f"Switched to backup proxy: {self.current_proxy}")
             return self.current_proxy
 
-        # No available backup – fall back to primary
-        logger.warning("No available backups, falling back to primary")
-        self.current_proxy = self.primary
-        return self.primary
+        # No available backup – fall back to default Telegram API
+        logger.warning("No available backups, falling back to default Telegram API.")
+        self.current_proxy = self._default_fallback
+        return self._default_fallback
 
     def add_backup(self, url: str):
         """Add a new backup proxy."""
-        # Check if already exists
         for b in self.backups:
             if b['url'] == url:
                 return
@@ -136,5 +134,23 @@ class ProxyManager:
         # For backups, update their last_used (already done when selected)
 
     def get_all_proxies(self) -> List[str]:
-        """Get all known proxies (primary + backups)."""
-        return [self.primary] + [b['url'] for b in self.backups]
+        """Get all known proxies (primary + backups + fallback)."""
+        return [self.primary] + [b['url'] for b in self.backups] + [self._default_fallback]
+
+    def clear_cache(self) -> None:
+        """Clear in-memory state (keeps storage file)."""
+        self.primary_fail_start = None
+        self.current_proxy = self.primary
+        logger.info("ProxyManager cache cleared (failure timer reset)")
+
+    def get_info(self) -> Dict[str, Any]:
+        """Return information about the manager."""
+        return {
+            "type": "ProxyManager",
+            "primary": self.primary,
+            "backups": len(self.backups),
+            "current_proxy": self.current_proxy,
+            "primary_failing": self.primary_fail_start is not None,
+            "storage_file": str(self.storage_file),
+            "default_fallback": self._default_fallback
+        }

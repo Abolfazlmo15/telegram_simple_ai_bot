@@ -5,6 +5,7 @@ import hashlib
 import logging
 import struct
 import zlib
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Tuple, Dict, List, Any
@@ -24,6 +25,8 @@ class UserDataManager:
     - History with text, image, voice entries and generated content
     - Search history by keyword
     - Preference management via PreferenceManager
+    - Unified priority system for all engines (text, vision, voice, voice_gen)
+    - In-memory caching with TTL for performance
     """
 
     def __init__(self, base_dir: str = Config.USER_DATA_DIR, cache_file: str = Config.CACHE_FILE):
@@ -40,7 +43,14 @@ class UserDataManager:
         from core.managers.preference_manager import PreferenceManager
         self.preference_manager = PreferenceManager(self)
 
-        logger.info(f"User data manager initialized (dir: {self.base_dir})")
+        # ============================================================
+        # PERFORMANCE: In-memory TTL Caches
+        # ============================================================
+        self._priority_cache: Dict[str, Tuple[Optional[List[str]], float]] = {}  # key: f"{user_id}_{engine}" -> (list, timestamp)
+        self._pref_cache: Dict[int, Tuple[Dict, float]] = {}  # user_id -> (prefs, timestamp)
+        self._cache_ttl = 60  # 60 seconds TTL to balance freshness and performance
+
+        logger.info(f"User data manager initialized (dir: {self.base_dir}) with TTL caching (TTL: {self._cache_ttl}s)")
 
     # ---------- USER DIRECTORY & INFO ----------
     def _get_user_dir(self, user_id: int, username: Optional[str]) -> Path:
@@ -85,12 +95,22 @@ class UserDataManager:
     # ========== PREFERENCE MANAGER METHODS ==========
     async def get_preferences(self, user_id: int, username: Optional[str] = None) -> Dict[str, Any]:
         """Get user preferences via PreferenceManager."""
-        return await self.preference_manager.get_preferences(user_id, username)
+        # Check in-memory cache first
+        if user_id in self._pref_cache:
+            prefs, timestamp = self._pref_cache[user_id]
+            if time.time() - timestamp < self._cache_ttl:
+                return prefs
+        prefs = await self.preference_manager.get_preferences(user_id, username)
+        self._pref_cache[user_id] = (prefs, time.time())
+        return prefs
 
     async def save_preferences(self, user_id: int, username: Optional[str],
                                preferences: Dict[str, Any]) -> bool:
         """Save user preferences via PreferenceManager."""
-        return await self.preference_manager.save_preferences(user_id, username, preferences)
+        result = await self.preference_manager.save_preferences(user_id, username, preferences)
+        if result:
+            self._pref_cache[user_id] = (preferences, time.time())
+        return result
 
     async def get_preference(self, user_id: int, key: str,
                              username: Optional[str] = None) -> Any:
@@ -649,24 +669,40 @@ class UserDataManager:
 
     # ---------- PRIORITY ----------
     async def get_user_model_priority(self, user_id: int, username: Optional[str], engine: str = "text") -> Optional[List[str]]:
+        """
+        Get user's model priority list for a specific engine.
+        engine: "text", "vision", "voice", "voice_gen"
+        """
+        cache_key = f"{user_id}_{engine}"
+        if cache_key in self._priority_cache:
+            priority_list, timestamp = self._priority_cache[cache_key]
+            if time.time() - timestamp < self._cache_ttl:
+                return priority_list
+
         user_dir = self._get_user_dir(user_id, username)
         priority_file = user_dir / "model_priority.json"
+        result = None
         if priority_file.exists():
             try:
                 with open(priority_file, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                if isinstance(data, list) and engine == "text":
-                    return data
-                elif isinstance(data, dict):
-                    return data.get(engine, []) if engine in data else None
-                else:
-                    return None
+                if isinstance(data, dict):
+                    result = data.get(engine, [])
+                elif isinstance(data, list) and engine == "text":
+                    # Backward compatibility: old format
+                    result = data
             except Exception as e:
                 logger.error(f"Failed to load priority for {user_id} ({engine}): {e}")
-        return None
+
+        self._priority_cache[cache_key] = (result, time.time())
+        return result
 
     async def save_model_priority(self, user_id: int, username: Optional[str],
                                   priority_list: List[str], engine: str = "text"):
+        """
+        Save user's model priority list for a specific engine.
+        engine: "text", "vision", "voice", "voice_gen"
+        """
         user_dir = self._get_user_dir(user_id, username)
         priority_file = user_dir / "model_priority.json"
         try:
@@ -679,6 +715,8 @@ class UserDataManager:
             existing[engine] = priority_list
             with open(priority_file, 'w', encoding='utf-8') as f:
                 json.dump(existing, f, indent=2)
+            # Update cache
+            self._priority_cache[f"{user_id}_{engine}"] = (priority_list, time.time())
             logger.info(f"Saved {engine} priority for user {user_id}")
         except Exception as e:
             logger.error(f"Failed to save {engine} priority for {user_id}: {e}")

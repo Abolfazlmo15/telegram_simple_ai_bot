@@ -3,7 +3,7 @@ Topic detection and tracking for conversations.
 """
 import logging
 import re
-from typing import Dict, List, Optional, Set, Any
+from typing import Dict, List, Optional, Set, Any, Tuple
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -115,6 +115,13 @@ class TopicManager:
         if user_id in self._current_topic:
             del self._current_topic[user_id]
         logger.info(f"📊 Cleared topics for user {user_id}")
+
+    def clear_cache(self) -> None:
+        """Clear all in-memory topic data."""
+        self._user_topics.clear()
+        self._topic_counts.clear()
+        self._current_topic.clear()
+        logger.info("📊 TopicManager cache cleared")
 
     def get_info(self) -> Dict[str, Any]:
         """Return information about the manager."""

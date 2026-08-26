@@ -3,7 +3,7 @@ import logging
 import threading
 import time
 import httpx
-from typing import List
+from typing import List, Optional
 from core.config import Config
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,7 @@ class ImageModelManager:
         self.is_running = False
         self.update_interval = 600  # 10 minutes
         self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
 
         # Fallback models if API fetch fails (verified working models)
         self.fallback_models = [
@@ -29,6 +30,7 @@ class ImageModelManager:
             "openai/gpt-5-image",
             "bytedance-seed/seedream-4.5",
         ]
+        logger.info("🔷 ImageModelManager initialized")
 
     def start(self):
         """Start the background model checker."""
@@ -36,15 +38,15 @@ class ImageModelManager:
             return
         self.is_running = True
         self._fetch_and_update_models()
-        self.thread = threading.Thread(target=self._background_loop, daemon=True)
-        self.thread.start()
+        self._thread = threading.Thread(target=self._background_loop, daemon=True)
+        self._thread.start()
         logger.info("🔷 OpenRouter Image Model Manager started (updates every 10 minutes)")
 
     def stop(self):
         """Stop the background model checker."""
         self.is_running = False
-        if hasattr(self, 'thread'):
-            self.thread.join(timeout=2.0)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
         logger.info("🔷 OpenRouter Image Model Manager stopped")
 
     def _background_loop(self):
@@ -81,7 +83,7 @@ class ImageModelManager:
                         self.available_models = image_models
                         logger.info(f"🖼️ OpenRouter image models updated: {len(image_models)} models available")
                     else:
-                        self.available_models = self.fallback_models
+                        self.available_models = self.fallback_models.copy()
                         logger.warning("⚠️ No OpenRouter image models detected, using fallback models")
 
         except httpx.HTTPStatusError as e:
@@ -91,23 +93,14 @@ class ImageModelManager:
                 logger.error(f"Failed to fetch OpenRouter image models: {e}")
             with self._lock:
                 if not self.available_models:
-                    self.available_models = self.fallback_models
+                    self.available_models = self.fallback_models.copy()
         except Exception as e:
             logger.error(f"Failed to fetch OpenRouter image models: {e}")
             with self._lock:
                 if not self.available_models:
-                    self.available_models = self.fallback_models
+                    self.available_models = self.fallback_models.copy()
 
     def get_available_models(self) -> List[str]:
         """Get list of available OpenRouter image generation models."""
         with self._lock:
             return self.available_models.copy() if self.available_models else self.fallback_models.copy()
-
-    def get_engine_info(self) -> dict:
-        """Return manager information."""
-        return {
-            "type": "OpenRouterImageModelManager",
-            "is_running": self.is_running,
-            "total_models": len(self.available_models) if self.available_models else 0,
-            "models": self.available_models[:5] if self.available_models else self.fallback_models[:5]  # Show first 5
-        }

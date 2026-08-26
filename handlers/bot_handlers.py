@@ -16,10 +16,12 @@ from core.analytics.analytics_engine import AnalyticsEngine
 from core.utils.response_formatter import ResponseFormatter
 
 # ============================================================
-# NEW: Import memory, topic, and preference managers
+# Import memory, topic, health, and cache managers
 # ============================================================
 from core.managers.memory_manager import MemoryManager
 from core.managers.topic_manager import TopicManager
+from core.managers.health_checker import HealthChecker
+from core.managers.cache_manager import CacheManager
 
 # Import TelegramFormatter from prompt_engineering
 from prompt_engineering.formatters import TelegramFormatter
@@ -31,18 +33,21 @@ logger = logging.getLogger(__name__)
 class BotHandlers:
     def __init__(self, engine: BaseEngine, voice_engine: VoiceEngine,
                  rate_limiter: RateLimiter, user_data_manager: UserDataManager,
-                 analytics_engine: AnalyticsEngine, proxy_manager: ProxyManager):
+                 analytics_engine: AnalyticsEngine, proxy_manager: ProxyManager,
+                 health_checker: HealthChecker, cache_manager: CacheManager):
         self.engine = engine
         self.voice_engine = voice_engine
         self.rate_limiter = rate_limiter
         self.user_data_manager = user_data_manager
         self.analytics_engine = analytics_engine
         self.proxy_manager = proxy_manager
+        self.health_checker = health_checker
+        self.cache_manager = cache_manager
         self.formatter = ResponseFormatter()
         self.telegram_formatter = TelegramFormatter()
 
         # ============================================================
-        # NEW: Initialize memory and topic managers
+        # Initialize memory and topic managers
         # ============================================================
         self.memory_manager = MemoryManager(
             base_dir=Config.USER_DATA_DIR,
@@ -60,7 +65,7 @@ class BotHandlers:
         # Set the text engine on the mode detector for LLM fallback
         self.engine.mode_detector.set_text_engine(self.engine.text_engine)
 
-        logger.info("📋 BotHandlers initialized with Memory, Topic, and ContextRefiner")
+        logger.info("📋 BotHandlers initialized with Memory, Topic, ContextRefiner, HealthChecker, and CacheManager")
 
     # ========== COMMAND HANDLERS ==========
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -107,10 +112,13 @@ class BotHandlers:
             f"/help - Show this help message\n"
             f"/about - Learn about the bot\n"
             f"/status - Check your usage\n"
-            f"/clear - Clear your history\n"
-            f"/prioritize_text_engine - Set priority for text models\n"
-            f"/prioritize_vision_engine - Set priority for vision models\n"
-            f"/image_priority - Set priority for image generation tiers\n\n"
+            f"/clear - Clear your history\n\n"
+            f"🎯 *Priority Commands:*\n"
+            f"/text_engine_priority - Set priority for Text models\n"
+            f"/vision_engine_priority - Set priority for Vision models\n"
+            f"/voice_engine_priority - Set priority for Voice STT models\n"
+            f"/voice_gen_priority - Set priority for Voice Generation (TTS) models\n"
+            f"/image_gen_priority - Set priority for Image Generation tiers\n\n"
             f"💡 *Voice Mode:*\n"
             f"• Say 'talk to me' to switch to voice responses\n"
             f"• Say 'type it' or 'text mode' to switch back to text\n"
@@ -132,18 +140,19 @@ class BotHandlers:
         text = self.formatter.format_response(
             f"🧠 *About This Bot*\n\n"
             f"This is an advanced AI chatbot featuring:\n\n"
-            f"• 🚀 *Fast Response Times* - Optimized with HTTP/2\n"
+            f"• 🚀 *Fast Response Times* - Optimized with HTTP/2, parallel testing, and health checks\n"
             f"• 💾 *Smart Caching* - Instant answers to common questions\n"
             f"• 📊 *Analytics* - Continuous improvement\n"
             f"• 💬 *Context Awareness* - Remembers conversation history\n"
             f"• 🧠 *Memory* - Long-term and short-term memory for better context\n"
-            f"• 🎯 *Model Priority* - Customize your AI experience\n"
+            f"• 🎯 *Model Priority* - Customize your AI experience for all engines\n"
             f"• 🖼️ *Vision Capabilities* - Image analysis and description\n"
             f"• 🎤 *Voice Transcription* - Send a voice note, get a reply\n"
             f"• 🎨 *Image Generation* - Generate images from text\n"
             f"• 🔊 *Voice Generation* - Text-to-speech\n"
             f"• 🗣️ *Voice Mode* - Talk to me and I'll respond in voice\n"
-            f"• 📊 *Topic Tracking* - I understand what topics we're discussing\n\n"
+            f"• 📊 *Topic Tracking* - I understand what topics we're discussing\n"
+            f"• 🏥 *Health Checking* - Auto-detects failing models to skip them\n\n"
             f"*Powered by:*\n"
             f"• DeepSeek, Qwen, and Llama Vision models\n"
             f"• Whisper for speech-to-text\n"
@@ -164,6 +173,13 @@ class BotHandlers:
         short_term = await self.memory_manager.get_short_term(user_id)
         long_term = await self.memory_manager.get_long_term(user_id)
 
+        # Get priorities
+        text_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "text")
+        vision_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "vision")
+        voice_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "voice")
+        voice_gen_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "voice_gen")
+        image_priority = await self.user_data_manager.get_image_generation_priority(user_id, username)
+
         text = f" *Your Status*\n\n"
         text += f"*Rate Limit:*\n"
         text += f"Remaining: {remaining}/{self.rate_limiter.max_requests}\n"
@@ -183,6 +199,13 @@ class BotHandlers:
         text += f"\n*Memory Stats:*\n"
         text += f"Short-term entries: {len(short_term)}\n"
         text += f"Long-term summaries: {len(long_term)}\n"
+
+        text += f"\n*Priority Stats:*\n"
+        text += f"• Text: {text_priority[0] if text_priority else 'Default'}\n"
+        text += f"• Vision: {vision_priority[0] if vision_priority else 'Default'}\n"
+        text += f"• Voice STT: {voice_priority[0] if voice_priority else 'Default'}\n"
+        text += f"• Voice Gen: {voice_gen_priority[0] if voice_gen_priority else 'Default'}\n"
+        text += f"• Image Gen: {image_priority[0] if image_priority else 'Default'}"
 
         text = self.formatter.format_response(text)
         await self._send_chunked_message(update, text)
@@ -214,14 +237,31 @@ class BotHandlers:
     async def prioritize_vision_engine(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await self._start_priority_setup(update, context, engine="vision")
 
+    async def prioritize_voice_engine(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._start_priority_setup(update, context, engine="voice")
+
+    async def prioritize_voice_generation(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        await self._start_priority_setup(update, context, engine="voice_gen")
+
     async def _start_priority_setup(self, update: Update, context: ContextTypes.DEFAULT_TYPE, engine: str) -> None:
         user = update.effective_user
         context.user_data.clear()
+
+        engine_display_names = {
+            "text": "Text Analysis",
+            "vision": "Vision Analysis",
+            "voice": "Voice STT (Speech-to-Text)",
+            "voice_gen": "Voice Generation (TTS)"
+        }
 
         if engine == "text":
             available_models = self.engine.text_engine.model_manager.get_fast_models()
         elif engine == "vision":
             available_models = self.engine.vision_engine.model_manager.get_available_models()
+        elif engine == "voice":
+            available_models = self.engine.voice_engine.openrouter_models
+        elif engine == "voice_gen":
+            available_models = self.engine.voice_generation_engine.models
         else:
             await update.message.reply_text("❌ Unknown engine type.")
             return
@@ -241,12 +281,14 @@ class BotHandlers:
         context.user_data['current_step'] = 1
         context.user_data['engine'] = engine
 
+        display_name = engine_display_names.get(engine, engine.title())
+
         model_list = "\n".join([f"{i + 1}. `{m}`" for i, m in enumerate(available_models[:10])])
         if len(available_models) > 10:
             model_list += f"\n... and {len(available_models) - 10} more"
 
         text = (
-            f"🎯 *{engine.title()} Engine Priority Setup*\n\n"
+            f"🎯 *{display_name} Priority Setup*\n\n"
             f"*Available models:*\n{model_list}\n\n"
             f"Let's set your priority. Which model should be *#1*?\n\n"
             f"_Type the exact model name (e.g., deepseek/deepseek-chat:free)_\n"
@@ -288,8 +330,15 @@ class BotHandlers:
             context.user_data.clear()
 
             final_list = "\n".join([f"{i + 1}. `{m}`" for i, m in enumerate(priority_list)])
+            display_name = {
+                "text": "Text Analysis",
+                "vision": "Vision Analysis",
+                "voice": "Voice STT",
+                "voice_gen": "Voice Generation"
+            }.get(engine, engine.title())
+
             text = (
-                f"✅ *Priority Saved for {engine.title()} Engine!*\n\n"
+                f"✅ *Priority Saved for {display_name}!*\n\n"
                 f"*Your new model order:*\n{final_list}\n\n"
                 f"The bot will now use these models in this order for {engine} queries."
             )
@@ -324,8 +373,15 @@ class BotHandlers:
             context.user_data.clear()
 
             final_list = "\n".join([f"{i + 1}. `{m}`" for i, m in enumerate(priority_list)])
+            display_name = {
+                "text": "Text Analysis",
+                "vision": "Vision Analysis",
+                "voice": "Voice STT",
+                "voice_gen": "Voice Generation"
+            }.get(engine, engine.title())
+
             text = (
-                f"✅ *Priority Saved for {engine.title()} Engine!*\n\n"
+                f"✅ *Priority Saved for {display_name}!*\n\n"
                 f"*Your new model order:*\n{final_list}\n\n"
                 f"The bot will now use these models in this order for {engine} queries."
             )
@@ -554,32 +610,29 @@ class BotHandlers:
             history = user_data.get('history', [])
 
             # ============================================================
-            # NEW: Update memory and topic tracking
+            # Update memory and topic tracking
             # ============================================================
-            # Add user message to memory
             await self.memory_manager.add_interaction(
                 user_id=user_id,
                 message=user_text,
-                response="",  # Will be updated after response
+                response="",
                 category="text"
             )
 
-            # Detect and track topic
             detected_topic = await self.topic_manager.add_message(user_id, user_text)
             if detected_topic:
                 logger.info(f"📊 Topic detected: {detected_topic}")
 
-            # Get memory context for the engine
             memory_context = await self.memory_manager.get_context(user_id, limit=5)
 
             # ============================================================
-            # NEW: Get user preferences
+            # Get user preferences and priorities
             # ============================================================
             preferences = await self.user_data_manager.get_preferences(user_id, username)
             custom_instructions = await self.user_data_manager.get_custom_instructions(user_id, username)
 
             # ============================================================
-            # Process via base engine – pass memory and preferences
+            # Process via base engine – pass memory, preferences, and priorities
             # ============================================================
             result, model_used, metadata = await self.engine.process(
                 user_text,
@@ -603,12 +656,10 @@ class BotHandlers:
                 # Check for image generation
                 if model_used.startswith("gen_image:"):
                     logger.info(f"📸 Generated image for user {user_id} using {model_used}")
-                    # Get the refined prompt from the generation context or use the original
                     last_gen = await self.engine.generation_context.get_last_generation(user_id)
                     prompt = last_gen.get('prompt', user_text) if last_gen else user_text
                     style = last_gen.get('style', 'no_style') if last_gen else 'no_style'
 
-                    # Format caption with safe Markdown (no HTML details)
                     caption = self.telegram_formatter.format_generated_image_caption(
                         prompt=prompt,
                         style=style,
@@ -618,7 +669,6 @@ class BotHandlers:
 
                     await placeholder.delete()
 
-                    # Send image with Markdown caption
                     await update.message.reply_photo(
                         photo=result,
                         caption=caption,
@@ -626,7 +676,6 @@ class BotHandlers:
                         reply_to_message_id=update.message.message_id
                     )
 
-                    # If prompt is long, send the full prompt in a separate message
                     if len(prompt) > 150:
                         full_prompt_msg = self.telegram_formatter.format_full_prompt_message(prompt)
                         await update.message.reply_text(
@@ -647,7 +696,6 @@ class BotHandlers:
                     )
 
                 else:
-                    # Unexpected bytes
                     logger.warning(f"Received bytes but model {model_used} not recognized as generation")
                     await placeholder.edit_text(
                         "❌ *Unexpected response format.*\n\n"
@@ -655,13 +703,10 @@ class BotHandlers:
                         parse_mode="Markdown"
                     )
             else:
-                # It's text response (analysis or mode switch)
                 formatted_response = self.formatter.format_response(result)
                 await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
 
-                # Save text history only if it's not a mode switch message
                 if not model_used.startswith("mode_switch"):
-                    # Update memory with the response
                     await self.memory_manager.add_interaction(
                         user_id=user_id,
                         message=user_text,
@@ -789,9 +834,11 @@ class BotHandlers:
         start_time = time.time()
         try:
             logger.info("🔵 Calling engine.process with image bytes")
+            # Get vision priority from user_data_manager
+            vision_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "vision")
             response, model_used, tokens_used = await self.engine.process(
                 bytes(image_bytes),
-                context={'query_text': query_text, 'user_id': user_id, 'username': username, 'input_type': 'image'}
+                context={'query_text': query_text, 'user_id': user_id, 'username': username, 'input_type': 'image', 'priority_list': vision_priority}
             )
             response_time = time.time() - start_time
             logger.info(f"✅ Vision response using {model_used} (tokens: {tokens_used})")
@@ -872,7 +919,6 @@ class BotHandlers:
             await update.message.reply_text("❌ Failed to download voice message. Please try again.", reply_to_message_id=update.message.message_id)
             return
 
-        # Save the audio file
         audio_file_path = await self.user_data_manager.save_audio_file(user_id, username, audio_bytes)
         self.user_data_manager.prune_voices(user_id, username, max_files=5)
         logger.info(f"🔊 Audio saved to {audio_file_path}")
@@ -881,14 +927,14 @@ class BotHandlers:
 
         start_time = time.time()
         try:
-            # Transcribe the audio
+            # Get voice STT priority
+            voice_priority = await self.user_data_manager.get_user_model_priority(user_id, username, "voice")
             transcription, voice_model, tokens_used = await self.voice_engine.transcribe(
                 audio_bytes,
-                context={'user_id': user_id, 'username': username}
+                context={'user_id': user_id, 'username': username, 'priority_list': voice_priority}
             )
             logger.info(f"🔊 Transcription: {transcription[:50]}...")
 
-            # Update memory with the transcription
             await self.memory_manager.add_interaction(
                 user_id=user_id,
                 message=f"[Voice message] {transcription}",
@@ -896,11 +942,9 @@ class BotHandlers:
                 category="voice"
             )
 
-            # Process the transcription through the main engine
             user_data = await self.user_data_manager.load_user_data(user_id, username)
             history = user_data.get('history', [])
 
-            # Get memory context and preferences
             memory_context = await self.memory_manager.get_context(user_id, limit=5)
             preferences = await self.user_data_manager.get_preferences(user_id, username)
 
@@ -920,9 +964,7 @@ class BotHandlers:
             response_time = time.time() - start_time
             total_tokens = tokens_used + (metadata if isinstance(metadata, int) else 0)
 
-            # Handle response
             if isinstance(result, bytes) and (model_used.startswith("gen_voice") or model_used.startswith("gen_voice_conversation")):
-                # Voice response
                 logger.info(f"🔊 Voice response to voice message using {model_used}")
                 await placeholder.delete()
                 await update.message.reply_voice(
@@ -931,7 +973,6 @@ class BotHandlers:
                     parse_mode="Markdown",
                     reply_to_message_id=update.message.message_id
                 )
-                # Update memory with the response
                 await self.memory_manager.add_interaction(
                     user_id=user_id,
                     message=f"[Voice message] {transcription}",
@@ -939,11 +980,9 @@ class BotHandlers:
                     category="voice"
                 )
             else:
-                # Text response (fallback or when mode is text)
                 formatted_response = self.formatter.format_response(result if isinstance(result, str) else transcription)
                 await placeholder.edit_text(formatted_response, parse_mode=Config.TELEGRAM_PARSE_MODE)
 
-                # Save voice history with text response
                 await self.user_data_manager.add_voice_to_history(
                     user_id=user_id,
                     username=username,
@@ -954,7 +993,6 @@ class BotHandlers:
                     tokens_used=total_tokens
                 )
 
-                # Update memory with the response
                 await self.memory_manager.add_interaction(
                     user_id=user_id,
                     message=f"[Voice message] {transcription}",

@@ -1,3 +1,6 @@
+"""
+Simple in-memory rate limiter with sliding window per user.
+"""
 import time
 import asyncio
 import logging
@@ -50,3 +53,17 @@ class RateLimiter:
         timestamps = self._history.get(user_id, [])
         valid = [t for t in timestamps if t > cutoff]
         return max(0, self.max_requests - len(valid))
+
+    def clear_cache(self) -> None:
+        """Clear all rate limiting history (resets all users)."""
+        self._history.clear()
+        logger.info("🔄 RateLimiter cache cleared (all user histories reset)")
+
+    def get_info(self) -> dict:
+        """Return information about the rate limiter."""
+        return {
+            "type": "RateLimiter",
+            "max_requests": self.max_requests,
+            "window_seconds": self.window_seconds,
+            "active_users": len(self._history)
+        }

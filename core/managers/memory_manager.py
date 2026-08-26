@@ -52,7 +52,6 @@ class MemoryManager:
 
         # Trim to max_short_term
         if len(self._short_term[user_id]) > self.max_short_term:
-            # Move older entries to long-term memory
             await self._compress_short_term(user_id)
 
     async def _compress_short_term(self, user_id: int) -> None:
@@ -185,6 +184,13 @@ class MemoryManager:
     async def is_memory_enabled(self, user_id: int) -> bool:
         """Check if memory is enabled (by default, always true)."""
         return True
+
+    def clear_cache(self) -> None:
+        """Clear all in-memory data (for testing/debugging)."""
+        self._short_term.clear()
+        self._long_term.clear()
+        self._topics.clear()
+        logger.info("🧹 MemoryManager cache cleared")
 
     def get_info(self) -> Dict[str, Any]:
         """Return information about the manager."""

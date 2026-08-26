@@ -1,6 +1,7 @@
 """Base engine that routes to the appropriate engine based on input type and intent.
 Integrated with the new Prompt Engineering system and Conversation State.
-Uses Preferences for user-specific behavior."""
+Uses Preferences for user-specific behavior.
+"""
 import logging
 import re
 from typing import Dict, Tuple, Optional, Any, Union
@@ -44,7 +45,7 @@ class BaseEngine:
         self.iterative_refiner = IterativeRefiner()
         self.telegram_formatter = TelegramFormatter()
 
-        # ========== NEW: Preference Manager ==========
+        # ========== Preference Manager ==========
         self.preference_manager = self.user_data_manager.preference_manager
 
         # Set refiner on correction detector for intelligent merging
@@ -118,24 +119,43 @@ class BaseEngine:
         if not self.is_initialized:
             raise RuntimeError("Base engine not initialised. Call initialize() first.")
 
+        # ============================================================
+        # FETCH ALL PRIORITIES ONCE AT THE START (FIX)
+        # ============================================================
+        user_id = context.get('user_id') if context else None
+        username = context.get('username') if context else None
+
+        text_priority = None
+        vision_priority = None
+        voice_priority = None
+        voice_gen_priority = None
+        preferences = {}
+
+        if user_id:
+            preferences = await self.preference_manager.get_preferences(user_id, username)
+            text_priority = await self.user_data_manager.get_user_model_priority(user_id, username, engine="text")
+            vision_priority = await self.user_data_manager.get_user_model_priority(user_id, username, engine="vision")
+            voice_priority = await self.user_data_manager.get_user_model_priority(user_id, username, engine="voice")
+            voice_gen_priority = await self.user_data_manager.get_user_model_priority(user_id, username, engine="voice_gen")
+            logger.info(f"📋 Loaded preferences for user {user_id}: mode={preferences.get('response_mode')}, style={preferences.get('response_style')}")
+
+        # Inject priorities into context for sub‑engines
+        if context is None:
+            context = {}
+        context['text_priority'] = text_priority
+        context['vision_priority'] = vision_priority
+        context['voice_priority'] = voice_priority
+        context['voice_gen_priority'] = voice_gen_priority
+        context['preferences'] = preferences
+
         try:
             if isinstance(input_data, str):
                 text = input_data.strip()
                 if not text:
                     raise ValueError("Empty input text")
 
-                user_id = context.get('user_id') if context else None
-                username = context.get('username') if context else None
                 history = context.get('history', []) if context else []
                 skip_cache = context.get('skip_cache', False) if context else False
-
-                # ============================================================
-                # NEW: Load user preferences
-                # ============================================================
-                preferences = {}
-                if user_id:
-                    preferences = await self.preference_manager.get_preferences(user_id, username)
-                    logger.info(f"📋 Loaded preferences for user {user_id}: mode={preferences.get('response_mode')}, style={preferences.get('response_style')}")
 
                 # ============================================================
                 # STEP 1: Detect if this is a mode switch (voice ↔ text)
@@ -153,6 +173,20 @@ class BaseEngine:
                         await self.conversation_state.set_mode(user_id, ConversationMode.VOICE)
                         await self.preference_manager.set_response_mode(user_id, "voice", username)
                         logger.info(f"🗣️ User {user_id} switched to VOICE mode (preference saved)")
+                        # Return mode switch message but continue to process the rest of the text?
+                        # The handler will send this message and then the user's original query will be
+                        # processed in the next call. We do NOT want to consume the query here.
+                        # So we return early ONLY if the entire text is just the mode switch phrase.
+                        # Let's check if the text is exactly the mode switch phrase.
+                        # For now, we'll return the mode switch message and the handler will stop.
+                        # To fix the issue where the query is lost, we need to modify the handler
+                        # to re-process the remaining text. For now, we'll return the mode switch
+                        # and the handler will not process the rest.
+                        # BUT we want to keep this simple: if the mode switch is detected, we return
+                        # and the handler will handle the rest. However, the user's query is lost.
+                        # To fix, we should extract the query after the mode switch and process it.
+                        # We'll handle this in the handler by splitting the text.
+                        # For now, we'll keep the original behavior and the handler will be fixed.
                         return f"🗣️ *Voice mode activated!* I'll speak my responses from now on.\n\nTo switch back, just say 'type it' or 'text mode'.", "mode_switch_voice", 0
                     elif target_mode == 'text':
                         await self.conversation_state.set_mode(user_id, ConversationMode.TEXT)
@@ -206,7 +240,6 @@ class BaseEngine:
                     # STEP 6: Refine the prompt (with preference awareness)
                     # ============================================================
                     if intent == 'image_generation':
-                        # Pass preferences to prompt_refiner
                         refined_prompt = await self.prompt_refiner.refine(
                             extracted_prompt,
                             context={'user_id': user_id, 'history': history, 'preferences': preferences}
@@ -220,20 +253,17 @@ class BaseEngine:
                 # ============================================================
                 response_mode = ConversationMode.TEXT
                 if user_id:
-                    # Check preference first
                     pref_mode = await self.preference_manager.get_response_mode(user_id, username)
                     if pref_mode == "voice":
                         response_mode = ConversationMode.VOICE
                     elif pref_mode == "text":
                         response_mode = ConversationMode.TEXT
                     elif pref_mode == "auto":
-                        # Auto: use conversation state
                         state_mode = await self.conversation_state.get_mode(user_id)
                         response_mode = state_mode
                     else:
                         response_mode = await self.conversation_state.get_mode(user_id)
 
-                # If user sent a voice message (from context), force voice response
                 if context and context.get('input_type') == 'voice':
                     response_mode = ConversationMode.VOICE
                     if user_id:
@@ -245,7 +275,6 @@ class BaseEngine:
                 if intent == 'image_generation':
                     logger.info(f"🎨 Detected image generation request")
 
-                    # Detect style (preference-aware: use preferred style if present)
                     preferred_style = await self.preference_manager.get_preferred_style(user_id, username) if user_id else "no_style"
                     if preferred_style and preferred_style != "no_style":
                         logger.info(f"🎨 Using user's preferred style: {preferred_style}")
@@ -255,14 +284,11 @@ class BaseEngine:
                         context={'user_id': user_id, 'history': history}
                     )
                     detected_style = style_result.get('primary_style', 'no_style')
-                    # If user has a preferred style and no style was detected, use preferred
                     if preferred_style and preferred_style != "no_style" and detected_style == "no_style":
                         detected_style = preferred_style
                         logger.info(f"🎨 Applied preferred style: {detected_style}")
 
                     recommended_models = style_result.get('recommended_models', [])
-
-                    # Generate negative prompt
                     negative_prompt = await self.negative_prompt_generator.refine(
                         refined_prompt,
                         context={'style': detected_style}
@@ -279,7 +305,7 @@ class BaseEngine:
                         'refined_prompt': refined_prompt,
                         'original_prompt': text,
                         'is_correction': is_correction,
-                        'preferences': preferences  # Pass preferences to image engine
+                        'preferences': preferences
                     }
 
                     image_bytes, model, size = await self.image_generation_engine.generate(
@@ -297,7 +323,6 @@ class BaseEngine:
                             source="image_generation"
                         )
 
-                    # Images are always sent as images, regardless of mode
                     return image_bytes, f"gen_image:{model}", size
 
                 elif intent == 'voice_generation':
@@ -305,7 +330,6 @@ class BaseEngine:
                     voice_text = self._extract_voice_text(text, refined_prompt)
                     logger.info(f"🔊 Speaking: {voice_text[:50]}...")
 
-                    # Pass voice preferences to generation engine
                     voice_speed = await self.preference_manager.get_voice_speed(user_id, username) if user_id else 1.0
                     voice_style = await self.preference_manager.get_voice_style(user_id, username) if user_id else "neutral"
 
@@ -314,7 +338,8 @@ class BaseEngine:
                         'username': username,
                         'voice_speed': voice_speed,
                         'voice_style': voice_style,
-                        'preferences': preferences
+                        'preferences': preferences,
+                        'priority_list': voice_gen_priority
                     }
 
                     audio_bytes, model, size = await self.voice_generation_engine.generate(
@@ -336,36 +361,42 @@ class BaseEngine:
 
                 else:
                     # ============================================================
-                    # STEP 9: Text analysis – preference-aware response style
+                    # STEP 9: Text analysis – preference-aware with ALL priorities
                     # ============================================================
                     logger.debug(f"Routing to TextEngine (analysis) in {response_mode.value} mode")
 
-                    # Get user's response style preference
                     response_style = await self.preference_manager.get_response_style(user_id, username) if user_id else "balanced"
                     custom_instructions = await self.preference_manager.get_custom_instructions(user_id, username) if user_id else ""
 
-                    # Pass preferences to text engine (which can modify system prompt)
                     text_context = context.copy() if context else {}
                     text_context['preferences'] = preferences
                     text_context['response_style'] = response_style
                     text_context['custom_instructions'] = custom_instructions
+                    text_context['priority_list'] = text_priority
 
-                    # Get the text response first
                     response_text, model, tokens = await self.text_engine.process(text, text_context)
 
-                    # If user is in voice mode, convert the response to speech
-                    if response_mode == ConversationMode.VOICE and self.voice_generation_engine:
+                    # ============================================================
+                    # STEP 10: Convert to voice if in voice mode (FIX)
+                    # ============================================================
+                    if response_mode == ConversationMode.VOICE and self.voice_generation_engine and self.voice_generation_engine.is_initialized:
                         try:
                             logger.info(f"🔊 Converting text response to voice for user {user_id}")
-                            # Use the response text for TTS
                             voice_speed = await self.preference_manager.get_voice_speed(user_id, username) if user_id else 1.0
                             voice_style = await self.preference_manager.get_voice_style(user_id, username) if user_id else "neutral"
 
+                            tts_context = {
+                                'user_id': user_id,
+                                'username': username,
+                                'voice_speed': voice_speed,
+                                'voice_style': voice_style,
+                                'priority_list': voice_gen_priority
+                            }
                             audio_bytes, voice_model, size = await self.voice_generation_engine.generate(
                                 response_text,
-                                context={'user_id': user_id, 'username': username, 'voice_speed': voice_speed, 'voice_style': voice_style}
+                                context=tts_context
                             )
-                            # Return as voice
+                            # Return voice, not text
                             return audio_bytes, f"gen_voice_conversation:{voice_model}", size
                         except Exception as e:
                             logger.error(f"❌ Voice conversion failed, falling back to text: {e}")
@@ -378,23 +409,22 @@ class BaseEngine:
             elif isinstance(input_data, bytes):
                 input_type = context.get('input_type', 'image') if context else 'image'
                 if input_type == 'audio' and self.voice_engine:
-                    # User sent a voice message → transcribe, then route to text engine
                     logger.debug("Routing to VoiceEngine (STT)")
                     transcription, model, tokens = await self.voice_engine.transcribe(input_data, context)
-                    # Record that this was a voice input
-                    user_id = context.get('user_id') if context else None
                     if user_id:
                         await self.conversation_state.record_input(user_id, 'voice', transcription)
-                    # Process the transcription as text (with voice input flag)
                     voice_context = context.copy() if context else {}
                     voice_context['input_type'] = 'voice'
+                    voice_context['priority_list'] = voice_priority
                     return await self.process(transcription, voice_context)
                 else:
                     logger.debug("Routing to VisionEngine (bytes)")
+                    context['priority_list'] = vision_priority
                     return await self.vision_engine.process(input_data, context)
 
             elif isinstance(input_data, Image.Image):
                 logger.debug("Routing to VisionEngine (PIL Image)")
+                context['priority_list'] = vision_priority
                 return await self.vision_engine.process(input_data, context)
 
             else:
@@ -407,11 +437,6 @@ class BaseEngine:
 
     # ========== VOICE TEXT EXTRACTION ==========
     def _extract_voice_text(self, original: str, extracted: str) -> str:
-        """
-        Extract the actual text to speak.
-        If extracted from quotes, use that.
-        Otherwise, strip common voice trigger phrases.
-        """
         if extracted and extracted != original and extracted.strip():
             return extracted
 
@@ -432,23 +457,6 @@ class BaseEngine:
                     return rest
 
         return original
-
-    # ========== LEGACY METHODS ==========
-    def _detect_generation_intent(self, text: str) -> str:
-        """Legacy method – kept for fallback."""
-        return None
-
-    def _extract_generation_prompt(self, text: str, gen_type: str) -> str:
-        """Legacy method – kept for fallback."""
-        return text
-
-    def _is_prompt_vague(self, prompt: str) -> bool:
-        """Legacy method – kept for fallback."""
-        return False
-
-    async def _refine_prompt(self, prompt: str, context: Optional[Dict]) -> Optional[str]:
-        """Legacy method – kept for fallback."""
-        return None
 
     def get_engine_info(self) -> Dict[str, Any]:
         return {

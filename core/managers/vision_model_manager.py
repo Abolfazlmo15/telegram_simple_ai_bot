@@ -1,9 +1,9 @@
-"""Dynamic manager for vision-capable models."""
+"""Dynamic manager for vision-capable models – filters only free models."""
 import logging
 import threading
 import time
 import httpx
-from typing import List
+from typing import List, Optional
 from core.config import Config
 
 logger = logging.getLogger(__name__)
@@ -13,6 +13,7 @@ class VisionModelManager:
     """
     Manages available vision-capable models from OpenRouter.
     Auto-updates every 10 minutes with live model availability.
+    Filters only free models (those with ':free' suffix or in the known free list).
     """
 
     def __init__(self):
@@ -20,6 +21,7 @@ class VisionModelManager:
         self.is_running = False
         self.update_interval = 600  # 10 minutes
         self._lock = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
 
         # Expanded list of known free vision models (verified on OpenRouter)
         self.known_vision_models = [
@@ -32,6 +34,7 @@ class VisionModelManager:
             "openai/gpt-4o-mini:free",
             "mistral/pixtral-12b:free"
         ]
+        logger.info("🔷 VisionModelManager initialized (free models only)")
 
     def start(self):
         """Start the background model checker."""
@@ -39,15 +42,15 @@ class VisionModelManager:
             return
         self.is_running = True
         self._fetch_and_update_models()
-        self.thread = threading.Thread(target=self._background_loop, daemon=True)
-        self.thread.start()
+        self._thread = threading.Thread(target=self._background_loop, daemon=True)
+        self._thread.start()
         logger.info("Vision model manager started (updates every 10 minutes)")
 
     def stop(self):
         """Stop the background model checker."""
         self.is_running = False
-        if hasattr(self, 'thread'):
-            self.thread.join(timeout=2.0)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
         logger.info("Vision model manager stopped")
 
     def _background_loop(self):
@@ -58,7 +61,7 @@ class VisionModelManager:
                 self._fetch_and_update_models()
 
     def _fetch_and_update_models(self):
-        """Fetch available vision models from OpenRouter."""
+        """Fetch available vision models from OpenRouter, keeping only free ones."""
         try:
             headers = {
                 "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
@@ -78,34 +81,54 @@ class VisionModelManager:
                 for model in all_models:
                     model_id = model.get("id", "")
                     model_id_lower = model_id.lower()
-                    # Check if any keyword appears
+                    # Check if it's a vision model and if it's free (':free' suffix)
                     if any(kw in model_id_lower for kw in vision_keywords):
-                        vision_models.append(model_id)
+                        if ":free" in model_id_lower:
+                            vision_models.append(model_id)
+                        else:
+                            # Also check if this model is in our known free list
+                            if model_id in self.known_vision_models:
+                                vision_models.append(model_id)
 
-                # Also add any known model that exists but wasn't caught
+                # Ensure all known free models are included
                 for known in self.known_vision_models:
                     if known not in vision_models:
-                        # Check if the base model exists (e.g., "meta-llama/llama-3.2-11b-vision-instruct:free" may appear without ":free")
-                        base = known.split(':')[0]
-                        if any(base in m.get("id", "") for m in all_models):
-                            vision_models.append(known)
+                        # Check if the base model exists (e.g., without ':free' suffix)
+                        # but we only want the free version, so we just add it anyway
+                        # because we know it's available on OpenRouter.
+                        vision_models.append(known)
 
                 with self._lock:
                     if vision_models:
-                        self.available_models = vision_models
-                        logger.info(f"Vision models updated: {len(vision_models)} models available")
+                        # Remove duplicates while preserving order
+                        seen = set()
+                        unique = []
+                        for m in vision_models:
+                            if m not in seen:
+                                seen.add(m)
+                                unique.append(m)
+                        self.available_models = unique
+                        logger.info(f"Vision models updated: {len(self.available_models)} free models available")
                     else:
-                        # Fallback to known models
-                        self.available_models = self.known_vision_models
-                        logger.warning("No vision models detected, using known fallback models")
+                        # Fallback to known free list
+                        self.available_models = self.known_vision_models.copy()
+                        logger.warning("No free vision models detected, using known fallback models")
 
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 402:
+                logger.warning("⚠️ OpenRouter vision models require payment (402). Using fallback models.")
+            else:
+                logger.error(f"Failed to fetch vision models: {e}")
+            with self._lock:
+                if not self.available_models:
+                    self.available_models = self.known_vision_models.copy()
         except Exception as e:
             logger.error(f"Failed to fetch vision models: {e}")
             with self._lock:
                 if not self.available_models:
-                    self.available_models = self.known_vision_models
+                    self.available_models = self.known_vision_models.copy()
 
     def get_available_models(self) -> List[str]:
-        """Get list of available vision models."""
+        """Get list of available vision models (free only)."""
         with self._lock:
             return self.available_models.copy() if self.available_models else self.known_vision_models.copy()

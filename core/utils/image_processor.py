@@ -70,3 +70,18 @@ class ImageProcessor:
             "width": img.width,
             "height": img.height
         }
+
+    def clear_cache(self) -> None:
+        """
+        Clear any internal state (stateless utility, no-op).
+        Provided for API consistency with other managers.
+        """
+        pass
+
+    def get_info(self) -> dict:
+        """Return information about the processor."""
+        return {
+            "type": "ImageProcessor",
+            "max_size": self.max_size,
+            "quality": self.quality
+        }

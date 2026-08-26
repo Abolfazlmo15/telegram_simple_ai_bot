@@ -304,3 +304,18 @@ class PromptLibrary:
         if category is None:
             return self.prompts[PromptCategory.CASUAL_CONVERSATION].system_message
         return self.prompts[category].system_message
+
+    def clear_cache(self) -> None:
+        """
+        Clear any internal state (stateless utility, no-op).
+        Provided for API consistency with other managers.
+        """
+        pass
+
+    def get_info(self) -> Dict:
+        """Return information about the library."""
+        return {
+            "type": "PromptLibrary",
+            "categories": [c.value for c in PromptCategory],
+            "total_prompts": len(self.prompts)
+        }
