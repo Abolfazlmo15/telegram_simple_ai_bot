@@ -173,20 +173,6 @@ class BaseEngine:
                         await self.conversation_state.set_mode(user_id, ConversationMode.VOICE)
                         await self.preference_manager.set_response_mode(user_id, "voice", username)
                         logger.info(f"🗣️ User {user_id} switched to VOICE mode (preference saved)")
-                        # Return mode switch message but continue to process the rest of the text?
-                        # The handler will send this message and then the user's original query will be
-                        # processed in the next call. We do NOT want to consume the query here.
-                        # So we return early ONLY if the entire text is just the mode switch phrase.
-                        # Let's check if the text is exactly the mode switch phrase.
-                        # For now, we'll return the mode switch message and the handler will stop.
-                        # To fix the issue where the query is lost, we need to modify the handler
-                        # to re-process the remaining text. For now, we'll return the mode switch
-                        # and the handler will not process the rest.
-                        # BUT we want to keep this simple: if the mode switch is detected, we return
-                        # and the handler will handle the rest. However, the user's query is lost.
-                        # To fix, we should extract the query after the mode switch and process it.
-                        # We'll handle this in the handler by splitting the text.
-                        # For now, we'll keep the original behavior and the handler will be fixed.
                         return f"🗣️ *Voice mode activated!* I'll speak my responses from now on.\n\nTo switch back, just say 'type it' or 'text mode'.", "mode_switch_voice", 0
                     elif target_mode == 'text':
                         await self.conversation_state.set_mode(user_id, ConversationMode.TEXT)

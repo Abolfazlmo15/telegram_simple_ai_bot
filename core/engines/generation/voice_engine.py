@@ -64,11 +64,19 @@ class VoiceGenerationEngine:
         try:
             timeout = httpx.Timeout(connect=10.0, read=Config.HTTP_TIMEOUT, write=30.0, pool=10.0)
             try:
-                self._client = httpx.AsyncClient(timeout=timeout, http2=True, limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5))
+                self._client = httpx.AsyncClient(
+                    timeout=timeout,
+                    http2=True,
+                    limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
+                )
                 logger.info("🔊 VoiceGenerationEngine HTTP/2 client created")
             except Exception:
                 logger.warning("HTTP/2 failed, falling back to HTTP/1.1")
-                self._client = httpx.AsyncClient(timeout=timeout, http2=False, limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5))
+                self._client = httpx.AsyncClient(
+                    timeout=timeout,
+                    http2=False,
+                    limits=httpx.Limits(max_connections=Config.CONNECTION_POOL_SIZE, max_keepalive_connections=5)
+                )
                 logger.info("🔊 VoiceGenerationEngine HTTP/1.1 client created")
             self.is_initialized = True
             logger.info("🔊 VoiceGenerationEngine initialized successfully")
@@ -241,11 +249,21 @@ class VoiceGenerationEngine:
             "X-Title": Config.BOT_NAME
         }
         voice = self._get_voice_for_model(model)
-        payload = {"model": model, "input": text, "voice": voice, "response_format": self.response_format}
+        payload = {
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "response_format": self.response_format
+        }
         if speed != 1.0:
             payload["speed"] = speed
 
-        resp = await self._client.post(Config.OPENROUTER_TTS_URL, headers=headers, json=payload, timeout=30.0)
+        resp = await self._client.post(
+            Config.OPENROUTER_TTS_URL,
+            headers=headers,
+            json=payload,
+            timeout=30.0
+        )
         resp.raise_for_status()
         return resp.content
 
@@ -272,8 +290,14 @@ class VoiceGenerationEngine:
             username = context.get('username')
             audio_path = await self.user_data_manager.save_audio_file(user_id, username, audio_bytes)
             await self.user_data_manager.add_generated_voice_to_history(
-                user_id=user_id, username=username, prompt=text, response="Voice generated successfully",
-                audio_file=audio_path, model_used=model, response_time=0.0, tokens_used=0
+                user_id=user_id,
+                username=username,
+                prompt=text,
+                response="Voice generated successfully",
+                audio_file=audio_path,
+                model_used=model,
+                response_time=0.0,
+                tokens_used=0
             )
         except Exception as e:
             logger.error(f"Failed to save voice to history: {e}")

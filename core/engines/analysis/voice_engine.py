@@ -2,6 +2,7 @@
 import logging
 import asyncio
 import time
+import httpx
 from typing import Dict, Tuple, Optional, Any, List
 import io
 from core.config import Config
@@ -238,31 +239,38 @@ class VoiceEngine:
             raise e
 
     async def _call_openrouter_stt(self, model: str, audio_bytes: bytes) -> Tuple[str, int]:
-        """Call OpenRouter Whisper API for transcription."""
-        import base64
-        b64_audio = base64.b64encode(audio_bytes).decode('utf-8')
+        """
+        Call OpenRouter Whisper API for transcription using multipart file upload.
+        This fixes the 400 Bad Request error.
+        """
         headers = {
             "Authorization": f"Bearer {Config.OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
             "HTTP-Referer": Config.BOT_REPO_URL,
             "X-Title": Config.BOT_NAME
         }
-        payload = {
-            "model": model,
-            "audio": f"data:audio/ogg;base64,{b64_audio}",
-            "response_format": "text"
+
+        # Prepare multipart/form-data fields
+        files = {
+            "audio": ("audio.ogg", audio_bytes, "audio/ogg"),
+            "model": (None, model),
+            "response_format": (None, "text")
         }
-        resp = await self._client.post(
-            "https://openrouter.ai/api/v1/audio/transcriptions",
-            headers=headers,
-            json=payload,
-            timeout=30.0
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        transcription = data.get("text", "").strip() if isinstance(data, dict) else str(data).strip()
-        tokens_used = len(transcription) // 4
-        return transcription, tokens_used
+
+        try:
+            resp = await self._client.post(
+                "https://openrouter.ai/api/v1/audio/transcriptions",
+                headers=headers,
+                files=files,
+                timeout=30.0
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            transcription = data.get("text", "").strip() if isinstance(data, dict) else str(data).strip()
+            tokens_used = len(transcription) // 4
+            return transcription, tokens_used
+        except Exception as e:
+            logger.error(f"OpenRouter STT call failed for {model}: {e}")
+            raise
 
     def get_engine_info(self) -> Dict:
         return {
