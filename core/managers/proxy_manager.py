@@ -4,7 +4,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from core.config import Config
 
 logger = logging.getLogger(__name__)
