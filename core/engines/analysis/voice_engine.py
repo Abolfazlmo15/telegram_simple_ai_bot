@@ -196,13 +196,16 @@ class VoiceEngine:
                     timer_task.cancel()
                     return result
 
-                # Check if restart was triggered
-                if timer_task.exception() and isinstance(timer_task.exception(), RestartSearchException):
-                    logger.info("Restart triggered, clearing blacklist and refreshing model list.")
-                    self._clear_blacklist()
-                    model_list = self._get_model_list(priority_list, self.openrouter_models)
-                    # Continue loop
+                # Check if restart was triggered – safely
+                if timer_task.done():
+                    exc = timer_task.exception()
+                    if exc and isinstance(exc, RestartSearchException):
+                        logger.info("Restart triggered, clearing blacklist and refreshing model list.")
+                        self._clear_blacklist()
+                        model_list = self._get_model_list(priority_list, self.openrouter_models)
+                        continue
                 else:
+                    # Timer still running, no restart
                     break
 
             raise Exception("All transcription methods failed. No restart triggered.")

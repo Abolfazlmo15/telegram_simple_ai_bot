@@ -138,20 +138,17 @@ class TextEngine:
             prompt_template.max_tokens = min(prompt_template.max_tokens, 300)
 
         # ============================================================
-        # TIMEOUT & RESTART LOGIC
+        # TIMEOUT & RESTART LOGIC – fixed using timer task exception
         # ============================================================
         start_time = time.time()
-        search_restart_triggered = False
 
-        # Create a timer task that will call status_callback after search_timeout
-        # and restart after restart_timeout
+        # Create a timer task that will raise RestartSearchException after the timeout
         timer_task = asyncio.create_task(
             self._search_timer(
                 status_callback,
                 search_timeout=self.search_timeout,
                 restart_timeout=self.restart_timeout,
-                start_time=start_time,
-                restart_flag_ref=search_restart_triggered  # Use a mutable reference
+                start_time=start_time
             )
         )
 
@@ -163,30 +160,29 @@ class TextEngine:
                 )
                 if result:
                     response, model, tokens_used = result
-                    # Cancel timer
                     timer_task.cancel()
                     # Save to cache
                     if user_id is not None:
                         self.user_data_manager.save_to_cache(input_data, response, category.value)
                     return response, model, tokens_used
 
-                # If we get here, all models failed. Check if restart was triggered.
-                if search_restart_triggered:
-                    logger.info("Restart triggered, clearing blacklist and refreshing model list.")
-                    self._clear_blacklist()
-                    # Re-fetch model list (with fresh blacklist)
-                    base_models = self.model_manager.get_smart_models() if complexity == "smart" else self.model_manager.get_fast_models()
-                    model_list = self._get_model_list(priority_list, base_models)
-                    search_restart_triggered = False
-                    # Continue loop
+                # If we get here, all models failed. Check if restart was triggered – safely.
+                if timer_task.done():
+                    exc = timer_task.exception()
+                    if exc and isinstance(exc, RestartSearchException):
+                        logger.info("Restart triggered, clearing blacklist and refreshing model list.")
+                        self._clear_blacklist()
+                        # Re-fetch model list (with fresh blacklist)
+                        base_models = self.model_manager.get_smart_models() if complexity == "smart" else self.model_manager.get_fast_models()
+                        model_list = self._get_model_list(priority_list, base_models)
+                        continue
                 else:
-                    # No restart, just break and raise error
+                    # Timer still running, no restart
                     break
 
             # If loop exits without success
             raise Exception("All text models failed. No restart triggered.")
         except Exception as e:
-            # Ensure timer is cancelled
             timer_task.cancel()
             raise e
         finally:
@@ -198,8 +194,7 @@ class TextEngine:
         status_callback: Optional[Callable[[str, bool], Coroutine]],
         search_timeout: int,
         restart_timeout: int,
-        start_time: float,
-        restart_flag_ref: bool
+        start_time: float
     ):
         """Background timer for search feedback and restart."""
         try:
@@ -224,11 +219,6 @@ class TextEngine:
             # Trigger restart
             if status_callback:
                 await status_callback("🔄 *Restarting search...*", edit=True)
-            # Set restart flag (mutable reference)
-            # Since we can't pass a bool by reference, we use a list or we set a global flag.
-            # We'll use a custom approach: we'll check the elapsed time in the main loop.
-            # Instead, we'll raise a custom exception that the main loop catches.
-            # We'll raise a RestartSearch exception.
             raise RestartSearchException("Restart search due to timeout")
         except asyncio.CancelledError:
             # Timer cancelled – success or another condition

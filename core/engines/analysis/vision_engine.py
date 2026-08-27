@@ -214,16 +214,19 @@ class VisionEngine:
                     timer_task.cancel()
                     return result
 
-                # 3. Check if restart was triggered
-                if timer_task.exception() and isinstance(timer_task.exception(), RestartSearchException):
-                    logger.info("Restart triggered, clearing blacklist and refreshing model list.")
-                    self._clear_blacklist()
-                    try:
-                        self.model_manager.get_available_models(force_refresh=True)
-                    except Exception:
-                        pass
-                    continue
+                # 3. Check if restart was triggered – safely
+                if timer_task.done():
+                    exc = timer_task.exception()
+                    if exc and isinstance(exc, RestartSearchException):
+                        logger.info("Restart triggered, clearing blacklist and refreshing model list.")
+                        self._clear_blacklist()
+                        try:
+                            self.model_manager.get_available_models(force_refresh=True)
+                        except Exception:
+                            pass
+                        continue
                 else:
+                    # Timer still running, no restart yet
                     break
 
             # All providers failed → PIL metadata fallback
