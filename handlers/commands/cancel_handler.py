@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from telegram import Update, CallbackQuery
 from telegram.ext import ContextTypes
@@ -9,7 +10,6 @@ class CancelHandler:
     """Handles the cancel button callback."""
 
     async def cancel_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Generic cancel callback. Expected data: cancel_{user_id}_{message_id}"""
         query: CallbackQuery = update.callback_query
         await query.answer()
 
@@ -17,6 +17,15 @@ class CancelHandler:
         if not data.startswith("cancel_"):
             return
 
+        # Handle special cancellations (e.g., cancel_mode, cancel_priority)
+        if data == "cancel_mode":
+            await query.edit_message_text("❌ Mode selection cancelled.")
+            return
+        if data == "cancel_priority" or data == "cancel_priority_setup":
+            await query.edit_message_text("❌ Priority setup cancelled.")
+            return
+
+        # Original cancellation for processing tasks
         try:
             _, user_id_str, msg_id_str = data.split("_")
             user_id = int(user_id_str)

@@ -2,12 +2,13 @@
 import logging
 import asyncio
 import base64
-import json
+import io
 import time
 from typing import Dict, Tuple, Optional, Any, List, Callable, Coroutine
+
 import httpx
 from PIL import Image
-import io
+
 from core.config import Config
 from core.managers.vision_model_manager import VisionModelManager
 from core.utils.image_processor import ImageProcessor
@@ -17,10 +18,16 @@ from core.managers.proxy_manager import ProxyManager
 logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------
-# Retry helper (exponential backoff)
+# Custom exception for restart
+# ------------------------------------------------------------------
+class RestartSearchException(Exception):
+    pass
+
+# ------------------------------------------------------------------
+# Retry helper with exponential backoff
 # ------------------------------------------------------------------
 async def _retry_async(func, *args, max_retries=2, base_delay=0.5, **kwargs):
-    """Retry an async function with exponential backoff."""
+    """Retry an async function with exponential backoff for network errors."""
     last_exc = None
     for attempt in range(max_retries + 1):
         try:
@@ -32,14 +39,10 @@ async def _retry_async(func, *args, max_retries=2, base_delay=0.5, **kwargs):
                 await asyncio.sleep(delay)
                 continue
             raise
-        except Exception as e:
-            # Non‑network errors should be re‑raised immediately
+        except Exception:
+            # Non‑network errors are re‑raised immediately
             raise
     raise last_exc
-
-# Custom exception for restart
-class RestartSearchException(Exception):
-    pass
 
 
 class VisionEngine:
@@ -48,7 +51,8 @@ class VisionEngine:
         self.api_key = Config.OPENROUTER_API_KEY
         self.base_url = Config.OPENROUTER_BASE_URL
         self.model_manager = VisionModelManager(proxy_manager=proxy_manager)
-        self.image_processor = ImageProcessor(max_size=128, quality=60)
+        # Increased max_size and quality for better analysis
+        self.image_processor = ImageProcessor(max_size=512, quality=85)
         self._client: Optional[httpx.AsyncClient] = None
         self.is_initialized = False
         self.user_data_manager = user_data_manager
@@ -68,10 +72,7 @@ class VisionEngine:
         self.search_timeout = Config.VISION_SEARCH_TIMEOUT_SECONDS
         self.restart_timeout = Config.GLOBAL_RESTART_TIMEOUT_SECONDS
 
-        # OpenRouter vision models – we will rely on the manager to provide free verified models
-        self._openrouter_vision_models = []  # will be populated by manager
-
-        logger.info("🔷 VisionEngine initialized (OpenRouter free verified → Hugging Face via proxy) with timeout/restart")
+        logger.info("🔷 VisionEngine initialized (OpenRouter free verified → Hugging Face via proxy)")
 
     async def initialize(self) -> bool:
         logger.info("🔷 VisionEngine.initialize: START")
@@ -138,39 +139,42 @@ class VisionEngine:
         context: Optional[Dict] = None,
         status_callback: Optional[Callable[[str, bool], Coroutine]] = None
     ) -> Tuple[str, str, int]:
+        """Process an image (bytes or PIL Image) and return description."""
         logger.info("🔷 VisionEngine.process: START")
         if not self.is_initialized:
             raise RuntimeError("Vision engine not initialized")
 
-        # Check for cancellation
         if asyncio.current_task().cancelled():
             raise asyncio.CancelledError
 
         user_id = context.get('user_id') if context else None
-        username = context.get('username') if context else None
         query_text = context.get('query_text', '').strip() if context else ''
         priority_list = context.get('priority_list') if context else None
         logger.info(f"🔷 user_id: {user_id}, query: {query_text[:50] if query_text else '(empty)'}...")
 
+        # --- Process the image ---
         try:
-            processed_image = await self.image_processor.process_image(input_data)
-            logger.info(f"🔷 Image processed: {processed_image.size[0]}x{processed_image.size[1]}")
-            pil_image = processed_image
+            pil_image = await self.image_processor.process_image(input_data)
+            logger.info(f"🔷 Image processed: {pil_image.size[0]}x{pil_image.size[1]}")
         except Exception as e:
             logger.error(f"❌ Image processing failed: {e}", exc_info=True)
-            raise ValueError(f"Could not process image: {e}")
+            # Return a user-friendly error instead of raising
+            return (
+                "❌ *Image Processing Failed*\n\n"
+                "The image could not be processed. Please try a different image.\n\n"
+                f"_Error: {str(e) or 'Unknown error'}_",
+                "image-processing-error",
+                0
+            )
 
-        # Convert to bytes and base64 once
+        # Convert to base64 for OpenRouter
         buffer = io.BytesIO()
         pil_image.save(buffer, format="JPEG", quality=85)
         image_bytes = buffer.getvalue()
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
 
-        # ============================================================
-        # TIMEOUT & RESTART LOGIC
-        # ============================================================
+        # --- Timeout & restart logic ---
         start_time = time.time()
-
         timer_task = asyncio.create_task(
             self._search_timer(
                 status_callback,
@@ -182,49 +186,47 @@ class VisionEngine:
 
         try:
             while True:
-                # Check cancellation
                 if asyncio.current_task().cancelled():
                     raise asyncio.CancelledError
 
-                # 1. FIRST: Try OpenRouter (free verified models from manager)
+                # 1. Try OpenRouter
                 dynamic_models = self.model_manager.get_available_models()
-                # Also add a few manually verified free vision models as fallback
                 verified_free_models = [
                     "google/gemini-2.0-flash-exp:free",
                     "meta-llama/llama-3.2-11b-vision-instruct:free",
                     "qwen/qwen-2-vl-7b-instruct:free",
                     "openai/gpt-4o-mini:free"
                 ]
-                # Combine user priority, dynamic models, and verified free
                 model_list = self._get_model_list(priority_list, dynamic_models, verified_free_models)
                 logger.info(f"🔷 OpenRouter model list (first 5): {model_list[:5] if model_list else 'EMPTY'}")
-                if model_list:
+
+                if model_list and self.api_key and len(self.api_key) > 10:
                     result = await self._try_openrouter_models(model_list, base64_image, query_text)
                     if result:
                         timer_task.cancel()
                         return result
+                else:
+                    logger.warning("🔷 OpenRouter skipped: no models or invalid API key")
 
-                # 2. FALLBACK: Try Hugging Face (via proxy)
+                # 2. Fallback: Hugging Face
                 result = await self._try_huggingface(pil_image, query_text)
                 if result:
                     timer_task.cancel()
                     return result
 
-                # If we reach here, all models failed. Check if restart was triggered.
+                # 3. Check if restart was triggered
                 if timer_task.exception() and isinstance(timer_task.exception(), RestartSearchException):
                     logger.info("Restart triggered, clearing blacklist and refreshing model list.")
                     self._clear_blacklist()
-                    # Force refresh of model manager (if available)
                     try:
                         self.model_manager.get_available_models(force_refresh=True)
                     except Exception:
                         pass
-                    # Continue loop
+                    continue
                 else:
-                    # No restart, break out
                     break
 
-            # All providers failed - PIL fallback
+            # All providers failed → PIL metadata fallback
             logger.warning("All providers failed. Using PIL metadata fallback.")
             width, height = pil_image.size
             mode = pil_image.mode
@@ -235,20 +237,28 @@ class VisionEngine:
                 f"• Size: {width} x {height} pixels\n"
                 f"• Mode: {mode}\n\n"
                 "I couldn't get an AI description. Please check:\n"
+                "• Your OpenRouter API key (must be valid)\n"
                 "• Your Hugging Face token (if using HF)\n"
-                "• Your OpenRouter API key\n"
                 "• Your internet connection\n\n"
                 "_Try again in a moment._"
             )
             timer_task.cancel()
             return response_text, "pil-fallback", len(response_text) // 4
+
         except asyncio.CancelledError:
             timer_task.cancel()
             logger.info("VisionEngine.process cancelled, re-raising")
             raise
         except Exception as e:
             timer_task.cancel()
-            raise
+            logger.error(f"❌ VisionEngine.process unexpected error: {e}", exc_info=True)
+            # Return a friendly error instead of raising
+            return (
+                f"❌ *Vision Error*\n\nSomething went wrong while analyzing the image.\n\n"
+                f"_Error: {str(e) or 'Unknown error'}_\n\nPlease try again later.",
+                "vision-error",
+                0
+            )
         finally:
             if not timer_task.done():
                 timer_task.cancel()
@@ -260,6 +270,7 @@ class VisionEngine:
         restart_timeout: int,
         start_time: float
     ):
+        """Background timer to show progress and trigger restart."""
         try:
             elapsed = 0
             while elapsed < search_timeout:
@@ -295,13 +306,13 @@ class VisionEngine:
 
         logger.info("🔷 Trying Hugging Face (fallback models via proxy)...")
         for model in self._hf_reliable_models:
-            # Check cancellation
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError
 
             if self._is_model_blacklisted(model):
                 logger.info(f"Skipping blacklisted HF model: {model}")
                 continue
+
             try:
                 logger.info(f"🔷 HF model: {model}")
                 response, model_used, tokens = await _retry_async(
@@ -315,6 +326,14 @@ class VisionEngine:
             except (httpx.ConnectError, httpx.ReadTimeout) as e:
                 logger.warning(f"HF {model} network error after retries: {e}. Blacklisting.")
                 self._mark_model_failure(model)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 402:
+                    logger.warning(f"HF {model} requires payment (402). Skipping.")
+                elif e.response.status_code in self._non_retryable_errors:
+                    logger.warning(f"HF {model} non-retryable error {e.response.status_code}. Blacklisting.")
+                    self._mark_model_failure(model)
+                else:
+                    logger.warning(f"HF {model} HTTP error: {e}")
             except Exception as e:
                 logger.warning(f"HF {model} failed: {e}")
                 self._mark_model_failure(model)
@@ -365,7 +384,6 @@ class VisionEngine:
             if m not in seen and not self._is_model_blacklisted(m):
                 ordered.append(m)
                 seen.add(m)
-        # If empty, return fallback even if blacklisted (emergency)
         if not ordered:
             logger.warning("OpenRouter model list is empty after filtering, using fallback.")
             return list(dict.fromkeys(fallback_models))
@@ -375,8 +393,12 @@ class VisionEngine:
         logger.info("🔷 Trying OpenRouter (free models) – primary...")
         system_prompt = self._build_vision_prompt(query)
 
+        # If API key is missing, skip immediately
+        if not self.api_key or len(self.api_key) < 10:
+            logger.warning("🔷 OpenRouter API key missing or invalid. Skipping.")
+            return None
+
         for model in model_list:
-            # Check cancellation
             if asyncio.current_task().cancelled():
                 raise asyncio.CancelledError
 
@@ -390,7 +412,7 @@ class VisionEngine:
                     )
                     if response and len(response) > 5:
                         logger.info(f"✅ OpenRouter succeeded with {model} (tokens: {tokens_used})")
-                        return (response, model, tokens_used)
+                        return response, model, tokens_used
                     else:
                         logger.warning(f"OpenRouter model {model} returned empty/short response")
                         self._mark_model_failure(model)
@@ -402,16 +424,21 @@ class VisionEngine:
                     else:
                         await asyncio.sleep(0.5)
                 except httpx.HTTPStatusError as e:
-                    if e.response.status_code in self._non_retryable_errors:
-                        logger.warning(f"Non-retryable error {e.response.status_code} for {model}, blacklisting.")
+                    status = e.response.status_code
+                    if status in self._non_retryable_errors:
+                        logger.warning(f"Non-retryable error {status} for {model}, blacklisting.")
                         self._mark_model_failure(model)
                         break
                     if attempt < Config.HTTP_MAX_RETRIES - 1:
                         await asyncio.sleep(0.5)
+                    else:
+                        self._mark_model_failure(model)
                 except Exception as e:
                     logger.warning(f"OR {model} attempt {attempt+1} failed: {e}")
                     if attempt < Config.HTTP_MAX_RETRIES - 1:
                         await asyncio.sleep(0.5)
+                    else:
+                        self._mark_model_failure(model)
         return None
 
     async def _call_openrouter(self, model: str, base64_image: str, query: str, system_prompt: str) -> Tuple[str, int]:
