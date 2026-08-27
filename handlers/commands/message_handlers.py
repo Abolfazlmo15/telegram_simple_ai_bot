@@ -88,30 +88,35 @@ class MessageHandlers:
         ])
         await placeholder.edit_reply_markup(reply_markup=keyboard)
 
-        async def process_task():
-            try:
-                await self._process_text_message(update, context, user_id, username, user_text, skip_cache, placeholder,
-                                                 keyboard)
-            except asyncio.CancelledError:
-                logger.info(f"Task cancelled for user {user_id}")
-                raise
-            except Exception as e:
-                logger.error(f"Task error for user {user_id}: {e}", exc_info=True)
-                try:
-                    await placeholder.edit_text(
-                        "❌ *Something Went Wrong*\n\n"
-                        "I encountered an error while processing your message. "
-                        "Please try again in a moment.",
-                        parse_mode="Markdown",
-                        reply_markup=None
-                    )
-                except Exception:
-                    pass
-            finally:
-                self._active_tasks.pop((user_id, placeholder_msg_id), None)
-
-        task = asyncio.create_task(process_task())
-        self._active_tasks[(user_id, placeholder_msg_id)] = task
+        # ============================================================
+        # INLINE PROCESSING – NO BACKGROUND TASK
+        # The webhook will wait for this to complete.
+        # ============================================================
+        try:
+            await self._process_text_message(
+                update, context, user_id, username, user_text,
+                skip_cache, placeholder, keyboard
+            )
+        except asyncio.CancelledError:
+            # This should not happen with inline processing, but handle it anyway
+            logger.info(f"Processing cancelled for user {user_id}")
+            await placeholder.edit_text(
+                "🛑 *Processing Cancelled*",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Error processing message for user {user_id}: {e}", exc_info=True)
+            await placeholder.edit_text(
+                "❌ *Something Went Wrong*\n\n"
+                "I encountered an error while processing your message. "
+                "Please try again in a moment.",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        finally:
+            # Remove from active tasks if it was ever stored (though it's not)
+            self._active_tasks.pop((user_id, placeholder_msg_id), None)
 
     async def _process_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE,
                                     user_id: int, username: str, user_text: str,
@@ -357,28 +362,26 @@ class MessageHandlers:
         ])
         await placeholder.edit_reply_markup(reply_markup=keyboard)
 
-        async def process_photo_task():
-            try:
-                await self._process_photo(update, user_id, username, query_text, image_bytes, matrix_info, placeholder,
-                                          keyboard)
-            except asyncio.CancelledError:
-                logger.info(f"Photo task cancelled for user {user_id}")
-                raise
-            except Exception as e:
-                logger.error(f"Photo task error for user {user_id}: {e}", exc_info=True)
-                try:
-                    await placeholder.edit_text(
-                        "❌ *Image analysis failed*\n\nPlease try again.",
-                        parse_mode="Markdown",
-                        reply_markup=None
-                    )
-                except Exception:
-                    pass
-            finally:
-                self._active_tasks.pop((user_id, placeholder_msg_id), None)
-
-        task = asyncio.create_task(process_photo_task())
-        self._active_tasks[(user_id, placeholder_msg_id)] = task
+        # Inline processing
+        try:
+            await self._process_photo(update, user_id, username, query_text, image_bytes, matrix_info, placeholder,
+                                      keyboard)
+        except asyncio.CancelledError:
+            logger.info(f"Photo task cancelled for user {user_id}")
+            await placeholder.edit_text(
+                "🛑 *Processing Cancelled*",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Photo task error for user {user_id}: {e}", exc_info=True)
+            await placeholder.edit_text(
+                "❌ *Image analysis failed*\n\nPlease try again.",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        finally:
+            self._active_tasks.pop((user_id, placeholder_msg_id), None)
 
     async def _process_photo(self, update, user_id, username, query_text, image_bytes, matrix_info, placeholder,
                              keyboard):
@@ -486,28 +489,26 @@ class MessageHandlers:
         ])
         await placeholder.edit_reply_markup(reply_markup=keyboard)
 
-        async def process_voice_task():
-            try:
-                await self._process_voice(update, user_id, username, audio_bytes, audio_file_path, placeholder,
-                                          keyboard)
-            except asyncio.CancelledError:
-                logger.info(f"Voice task cancelled for user {user_id}")
-                raise
-            except Exception as e:
-                logger.error(f"Voice task error for user {user_id}: {e}", exc_info=True)
-                try:
-                    await placeholder.edit_text(
-                        "❌ *Voice processing failed*\n\nPlease try again.",
-                        parse_mode="Markdown",
-                        reply_markup=None
-                    )
-                except Exception:
-                    pass
-            finally:
-                self._active_tasks.pop((user_id, placeholder_msg_id), None)
-
-        task = asyncio.create_task(process_voice_task())
-        self._active_tasks[(user_id, placeholder_msg_id)] = task
+        # Inline processing
+        try:
+            await self._process_voice(update, user_id, username, audio_bytes, audio_file_path, placeholder,
+                                      keyboard)
+        except asyncio.CancelledError:
+            logger.info(f"Voice task cancelled for user {user_id}")
+            await placeholder.edit_text(
+                "🛑 *Processing Cancelled*",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Voice task error for user {user_id}: {e}", exc_info=True)
+            await placeholder.edit_text(
+                "❌ *Voice processing failed*\n\nPlease try again.",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        finally:
+            self._active_tasks.pop((user_id, placeholder_msg_id), None)
 
     async def _process_voice(self, update, user_id, username, audio_bytes, audio_file_path, placeholder, keyboard):
         async def status_callback(msg: str, edit: bool = True):
