@@ -1,0 +1,34 @@
+name: Renew PythonAnywhere Web App
+
+on:
+  schedule:
+    # Run every 25th day of the month at 00:00 UTC
+    - cron: '0 0 25 * *'
+  workflow_dispatch:  # Allows manual trigger
+
+jobs:
+  renew:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests beautifulsoup4
+
+      - name: Run renewal script
+        env:
+          PYTHONANYWHERE_USERNAME: ${{ secrets.PYTHONANYWHERE_USERNAME }}
+          PYTHONANYWHERE_PASSWORD: ${{ secrets.PYTHONANYWHERE_PASSWORD }}
+          # Optional: if you have multiple web apps, specify the one you want to renew.
+          # PYTHONANYWHERE_WEBAPP_NAME: "your_app_name"
+        run: |
+          python scripts/renew_pythonanywhere.py
