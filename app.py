@@ -76,7 +76,6 @@ def init_telegram_app():
     # Base Engine
     print("🔄 Initializing Base Engine...")
     _engine = BaseEngine(_user_manager)
-    import asyncio
     engines_ready = asyncio.run(_engine.initialize())
     if not engines_ready:
         raise RuntimeError("Failed to initialize base engines")
@@ -161,7 +160,7 @@ def init_telegram_app():
 @app.route('/webhook', methods=['POST'])
 def webhook():
     """Handle incoming Telegram updates via webhook."""
-    print("🔔 Webhook called!")  # This will appear in the PythonAnywhere server log
+    print("🔔 Webhook called!")
     try:
         # Initialize once
         init_telegram_app()
@@ -187,10 +186,15 @@ def webhook():
         if update and update.message:
             print(f"💬 Message text: {update.message.text if update.message.text else '(not text)'}")
             print(f"👤 User: {update.message.from_user.id if update.message.from_user else 'Unknown'}")
+            # Check if the handler will process it
+            if hasattr(_handlers, 'handle_message'):
+                print("✅ _handlers.handle_message exists")
+            else:
+                print("❌ _handlers.handle_message does NOT exist")
         else:
             print("ℹ️ No message in this update.")
 
-        # Process the update synchronously (blocking) so the webhook waits for reply
+        # Process the update synchronously (blocking)
         print("⏳ Processing update...")
         async def process_update():
             async with _telegram_app:
