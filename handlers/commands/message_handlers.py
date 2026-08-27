@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class MessageHandlers:
-    """Handlers for text, photo, and voice messages."""
+    """Handlers for text, photo, voice, and document messages."""
 
     # ========== Text message handler ==========
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -613,5 +613,163 @@ class MessageHandlers:
         except Exception as e:
             logger.error(f"❌ Voice error: {e}", exc_info=True)
             await placeholder.edit_text(f"❌ *Voice processing failed*\n\n`{str(e)[:200]}`", parse_mode="Markdown",
+                                        reply_markup=None)
+            self._active_tasks.pop((user_id, placeholder.message_id), None)
+
+    # ========== Document handler (new) ==========
+    async def handle_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle PDF and DOCX document uploads."""
+        logger.info("📄 handle_document: START")
+        if not self.engine.is_initialized:
+            await update.message.reply_text("⚠️ Bot initializing...", reply_to_message_id=update.message.message_id)
+            return
+
+        user = update.effective_user
+        user_id = user.id
+        username = user.username
+
+        allowed, remaining = await self.rate_limiter.check(user_id)
+        if not allowed:
+            await self._handle_rate_limit(update, remaining)
+            return
+
+        document = update.message.document
+        file_name = document.file_name or "document"
+        file_extension = ""
+        if file_name and '.' in file_name:
+            file_extension = file_name.split('.')[-1].lower()
+            if not file_extension.startswith('.'):
+                file_extension = f".{file_extension}"
+
+        # Only support PDF and DOCX
+        if file_extension not in ('.pdf', '.docx'):
+            await update.message.reply_text(
+                f"❌ *Unsupported file type* – only PDF and DOCX are supported.\n"
+                f"Received: `{file_extension or 'unknown'}`",
+                parse_mode="Markdown",
+                reply_to_message_id=update.message.message_id
+            )
+            return
+
+        # Download file
+        file = await document.get_file()
+        full_file_url = file.file_path
+
+        if "/file/" in full_file_url:
+            relative_path = full_file_url.split("/file/", 1)[1]
+        else:
+            relative_path = full_file_url
+
+        proxy_base = self.proxy_manager.get_proxy().rstrip('/')
+        proxy_file_url = f"{proxy_base}/file/{relative_path}"
+
+        try:
+            file_bytes = await self._download_media(proxy_file_url)
+            if file_bytes is None:
+                await update.message.reply_text("❌ Failed to download document. Please try again.",
+                                                reply_to_message_id=update.message.message_id)
+                return
+        except Exception as e:
+            logger.error(f"❌ All proxy download attempts failed: {e}")
+            self.proxy_manager.mark_failure(proxy_base)
+            await update.message.reply_text("❌ Failed to download document. Please try again.",
+                                            reply_to_message_id=update.message.message_id)
+            return
+
+        # Show placeholder
+        placeholder = await update.message.reply_text(
+            "📄",
+            reply_to_message_id=update.message.message_id
+        )
+        placeholder_msg_id = placeholder.message_id
+
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{user_id}_{placeholder_msg_id}")]
+        ])
+        await placeholder.edit_reply_markup(reply_markup=keyboard)
+
+        try:
+            await self._process_document(update, user_id, username, file_bytes, file_extension,
+                                         update.message.caption or "", placeholder, keyboard)
+        except asyncio.CancelledError:
+            logger.info(f"Document task cancelled for user {user_id}")
+            await placeholder.edit_text(
+                "🛑 *Processing Cancelled*",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        except Exception as e:
+            logger.error(f"Document task error for user {user_id}: {e}", exc_info=True)
+            await placeholder.edit_text(
+                "❌ *Document processing failed*\n\nPlease try again.",
+                parse_mode="Markdown",
+                reply_markup=None
+            )
+        finally:
+            self._active_tasks.pop((user_id, placeholder_msg_id), None)
+
+    async def _process_document(self, update, user_id, username, file_bytes, file_extension,
+                                caption, placeholder, keyboard):
+        """Process the document with the DocumentEngine."""
+        async def status_callback(msg: str, edit: bool = True):
+            if edit:
+                try:
+                    await placeholder.edit_text(msg, parse_mode="Markdown", reply_markup=keyboard)
+                except Exception as e:
+                    logger.warning(f"Failed to edit placeholder: {e}")
+
+        start_time = time.time()
+        try:
+            # Build context for the document engine
+            doc_context = {
+                'user_id': user_id,
+                'username': username,
+                'file_extension': file_extension,
+                'caption': caption,
+                'input_type': 'document',
+                'preferences': await self.user_data_manager.get_preferences(user_id, username)
+            }
+
+            response, model_used, metadata = await self.engine.process(
+                file_bytes,
+                context=doc_context,
+                status_callback=status_callback
+            )
+
+            response_time = time.time() - start_time
+            logger.info(f"📄 Document processed using {model_used} (tokens: {metadata})")
+
+            # If response is very long, send it as a text file instead of a message
+            if len(response) > Config.DOCUMENT_MAX_TEXT_REPLY_CHARS:
+                # Send as .txt file
+                from telegram import InputFile
+                import io
+                txt_bytes = response.encode('utf-8')
+                txt_io = io.BytesIO(txt_bytes)
+                txt_io.name = "document_content.txt"
+                await placeholder.delete()
+                self._active_tasks.pop((user_id, placeholder.message_id), None)
+
+                await update.message.reply_document(
+                    document=InputFile(txt_io, filename="document_content.txt"),
+                    caption="📄 *Extracted content (too long for inline)*",
+                    parse_mode="Markdown",
+                    reply_to_message_id=update.message.message_id
+                )
+            else:
+                # Send as normal text
+                formatted = self.formatter.format_response(response)
+                await placeholder.edit_text(formatted, parse_mode=Config.TELEGRAM_PARSE_MODE, reply_markup=None)
+                self._active_tasks.pop((user_id, placeholder.message_id), None)
+
+            # Save to history (optional – we can add a dedicated method if needed)
+            # For now, we'll just log it; you may extend UserDataManager later.
+            logger.info(f"📄 Document response sent for user {user_id} in {response_time:.2f}s")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Document processing error: {e}", exc_info=True)
+            await placeholder.edit_text(f"❌ *Document processing failed*\n\n`{str(e)[:200]}`", parse_mode="Markdown",
                                         reply_markup=None)
             self._active_tasks.pop((user_id, placeholder.message_id), None)

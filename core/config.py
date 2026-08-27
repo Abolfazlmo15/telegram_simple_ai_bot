@@ -72,6 +72,14 @@ class Config:
     VISION_FALLBACK_TIMEOUT = 30.0
 
     # ============================================================
+    # DOCUMENT ANALYSIS CONFIG
+    # ============================================================
+    DOCUMENT_MAX_SIZE_MB = 10                     # Max file size in MB
+    DOCUMENT_MAX_TEXT_REPLY_CHARS = 4000          # Direct text reply length
+    DOCUMENT_MAX_AI_CONTEXT_CHARS = 8000          # Truncate to this many chars for AI
+    DOCUMENT_AI_SUMMARY_MAX_TOKENS = 300          # Token limit for summaries
+
+    # ============================================================
     # REST OF CONFIG (all attributes required by other modules)
     # ============================================================
     STYLE_KEYWORDS = {

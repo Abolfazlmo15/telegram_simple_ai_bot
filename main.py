@@ -1,5 +1,60 @@
 import os
 import sys
+import subprocess
+import importlib.metadata
+from pathlib import Path
+
+# ------------------------------------------------------------------
+# AUTOMATIC DEPENDENCY INSTALLER
+# Runs once at startup – installs only missing packages.
+# ------------------------------------------------------------------
+def ensure_dependencies():
+    """Install missing packages from requirements.txt using pip."""
+    req_file = Path("requirements.txt")
+    if not req_file.exists():
+        print("⚠️ requirements.txt not found – skipping auto-install.")
+        return
+
+    print("📦 Checking dependencies...")
+    missing = []
+    with open(req_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Extract package name (ignore version specifiers)
+            pkg_name = line.split(">=")[0].split("==")[0].split("<")[0].strip()
+            try:
+                importlib.metadata.distribution(pkg_name)
+                # print(f"✅ {pkg_name} already installed")
+            except importlib.metadata.PackageNotFoundError:
+                missing.append(line)
+            except Exception:
+                # Fallback: try installing anyway
+                missing.append(line)
+
+    if not missing:
+        print("✅ All dependencies are already installed.")
+        return
+
+    print(f"📦 Installing {len(missing)} missing package(s)...")
+    for pkg in missing:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", pkg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"✅ Installed: {pkg}")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to install {pkg}: {e}")
+
+# Run the installer before anything else
+ensure_dependencies()
+
+# ------------------------------------------------------------------
+# Regular imports (now dependencies are guaranteed)
+# ------------------------------------------------------------------
 import logging
 import asyncio
 from telegram import Update
@@ -73,8 +128,8 @@ def main() -> None:
         window_seconds=Config.RATE_LIMIT_WINDOW_SECONDS
     )
 
-    # ---------- Base Engine (Text + Vision + Voice) ----------
-    logger.info("🔄 Initializing Base Engine (Text + Vision + Voice)...")
+    # ---------- Base Engine (Text + Vision + Voice + Document) ----------
+    logger.info("🔄 Initializing Base Engine (Text + Vision + Voice + Document)...")
     engine = BaseEngine(user_manager)
     engines_ready = asyncio.run(engine.initialize())
     if not engines_ready:
@@ -152,6 +207,10 @@ def main() -> None:
     else:
         logger.warning("⚠️ Voice handler NOT registered (engine unavailable)")
 
+    # Document handler (new)
+    application.add_handler(MessageHandler(filters.Document.ALL, handlers.handle_document))
+    logger.info("✅ Document handler registered (PDF/DOCX)")
+
     # ============================================================
     # CALLBACK QUERY HANDLERS
     # ============================================================
@@ -170,6 +229,7 @@ def main() -> None:
     logger.info(f"💾 Cache: TTL={Config.CACHE_TTL_SECONDS}s, similarity={Config.CACHE_SIMILARITY_THRESHOLD}")
     logger.info(f"🏥 Health checker: interval={Config.HEALTH_CHECK_INTERVAL_SECONDS}s")
     logger.info(f"📦 Cache manager: max_size=5000, default_ttl=300s")
+    logger.info("📄 Document support: PDF and DOCX with AI summarization/Q&A")
 
     try:
         application.run_polling(

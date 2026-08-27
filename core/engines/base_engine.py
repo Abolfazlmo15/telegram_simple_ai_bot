@@ -19,6 +19,9 @@ from prompt_engineering.memory import GenerationContext, CorrectionDetector, Ite
 from prompt_engineering.templates import TemplateManager
 from prompt_engineering.formatters import TelegramFormatter
 
+# Import document engine (new)
+from core.engines.analysis.document_engine import DocumentEngine
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,6 +34,7 @@ class BaseEngine:
         self.voice_engine = None
         self.image_generation_engine = None
         self.voice_generation_engine = None
+        self.document_engine = None          # <-- new
         self.is_initialized = False
 
         # ========== Prompt Engineering Components ==========
@@ -96,6 +100,10 @@ class BaseEngine:
             await self.template_manager.initialize()
             self.prompt_refiner.text_engine = self.text_engine
 
+            # ========== Initialize Document Engine ==========
+            self.document_engine = DocumentEngine(self.user_data_manager, text_engine=self.text_engine)
+            logger.info("✅ Document engine initialised")
+
             self.is_initialized = True
             logger.info("✅ All engines and prompt engineering components initialised successfully")
             return True
@@ -129,7 +137,7 @@ class BaseEngine:
         Supports cancellation via asyncio.CancelledError.
 
         Args:
-            input_data: Text, bytes (image/audio), or PIL Image.
+            input_data: Text, bytes (image/audio/document), or PIL Image.
             context: Context dict with user_id, history, preferences, etc.
             status_callback: Async callback function (msg, edit) for updating status messages.
 
@@ -433,7 +441,16 @@ class BaseEngine:
 
             elif isinstance(input_data, bytes):
                 input_type = context.get('input_type', 'image') if context else 'image'
-                if input_type == 'audio' and self.voice_engine:
+
+                # --- Document handling (new) ---
+                if input_type == 'document' and self.document_engine:
+                    logger.debug("Routing to DocumentEngine")
+                    # Inject required info into context
+                    doc_context = context.copy() if context else {}
+                    # Ensure we have file_extension and caption
+                    return await self.document_engine.process(input_data, doc_context)
+
+                elif input_type == 'audio' and self.voice_engine:
                     logger.debug("Routing to VoiceEngine (STT)")
                     # Pass status_callback to voice engine transcribe
                     transcription, model, tokens = await self.voice_engine.transcribe(
@@ -448,10 +465,11 @@ class BaseEngine:
                     voice_context['priority_list'] = voice_priority
                     # Recursively process with status_callback
                     return await self.process(transcription, voice_context, status_callback)
+
                 else:
+                    # Default: treat as image (vision)
                     logger.debug("Routing to VisionEngine (bytes)")
                     context['priority_list'] = vision_priority
-                    # Pass status_callback to vision engine
                     return await self.vision_engine.process(
                         input_data,
                         context,
@@ -461,7 +479,6 @@ class BaseEngine:
             elif isinstance(input_data, Image.Image):
                 logger.debug("Routing to VisionEngine (PIL Image)")
                 context['priority_list'] = vision_priority
-                # Pass status_callback to vision engine
                 return await self.vision_engine.process(
                     input_data,
                     context,
@@ -511,6 +528,7 @@ class BaseEngine:
             "text_engine": self.text_engine.get_engine_info() if self.text_engine else None,
             "vision_engine": self.vision_engine.get_engine_info() if self.vision_engine else None,
             "voice_engine": self.voice_engine.get_engine_info() if self.voice_engine else None,
+            "document_engine": self.document_engine.get_engine_info() if self.document_engine else None,
             "image_generation_engine": self.image_generation_engine.get_engine_info() if self.image_generation_engine else None,
             "voice_generation_engine": self.voice_generation_engine.get_engine_info() if self.voice_generation_engine else None,
             "conversation_state": self.conversation_state.get_info() if hasattr(self.conversation_state, 'get_info') else {},

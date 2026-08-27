@@ -1,5 +1,60 @@
 import os
 import sys
+import subprocess
+import importlib.metadata
+from pathlib import Path
+
+# ------------------------------------------------------------------
+# AUTOMATIC DEPENDENCY INSTALLER
+# Runs once at startup – installs only missing packages.
+# ------------------------------------------------------------------
+def ensure_dependencies():
+    """Install missing packages from requirements.txt using pip."""
+    req_file = Path("requirements.txt")
+    if not req_file.exists():
+        print("⚠️ requirements.txt not found – skipping auto-install.")
+        return
+
+    print("📦 Checking dependencies...")
+    missing = []
+    with open(req_file, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Extract package name (ignore version specifiers)
+            pkg_name = line.split(">=")[0].split("==")[0].split("<")[0].strip()
+            try:
+                importlib.metadata.distribution(pkg_name)
+                # print(f"✅ {pkg_name} already installed")
+            except importlib.metadata.PackageNotFoundError:
+                missing.append(line)
+            except Exception:
+                # Fallback: try installing anyway
+                missing.append(line)
+
+    if not missing:
+        print("✅ All dependencies are already installed.")
+        return
+
+    print(f"📦 Installing {len(missing)} missing package(s)...")
+    for pkg in missing:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", pkg],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            print(f"✅ Installed: {pkg}")
+        except subprocess.CalledProcessError as e:
+            print(f"❌ Failed to install {pkg}: {e}")
+
+# Run the installer before anything else
+ensure_dependencies()
+
+# ------------------------------------------------------------------
+# Regular imports (now dependencies are guaranteed)
+# ------------------------------------------------------------------
 import json
 import asyncio
 import traceback
@@ -15,7 +70,6 @@ from core.managers.proxy_manager import ProxyManager
 from core.managers.health_checker import HealthChecker
 from core.managers.cache_manager import CacheManager
 from core.analytics.analytics_engine import AnalyticsEngine
-# Import the new combined BotHandlers
 from handlers.bot_handlers import BotHandlers
 
 app = Flask(__name__)
@@ -146,6 +200,11 @@ def init_telegram_app():
         print("✅ Voice message handler registered.")
     else:
         print("⚠️ Voice handler NOT registered (engine unavailable)")
+
+    # Document handler (new)
+    _telegram_app.add_handler(MessageHandler(filters.Document.ALL, _handlers.handle_document))
+    print("✅ Document handler registered (PDF/DOCX)")
+
     print("✅ Message handlers registered.")
 
     print("📝 Registering callback query handlers...")
@@ -186,7 +245,6 @@ def webhook():
         if update and update.message:
             print(f"💬 Message text: {update.message.text if update.message.text else '(not text)'}")
             print(f"👤 User: {update.message.from_user.id if update.message.from_user else 'Unknown'}")
-            # Check if the handler will process it
             if hasattr(_handlers, 'handle_message'):
                 print("✅ _handlers.handle_message exists")
             else:
