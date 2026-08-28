@@ -21,10 +21,29 @@ def event_loop():
 def mock_user_data_manager():
     """Mock UserDataManager."""
     manager = MagicMock(spec=UserDataManager)
-    manager.get_cached_response = AsyncMock(return_value=None)   # this one is async
-    manager.save_to_cache = MagicMock()                          # sync method
+
+    # ---------- SYNCHRONOUS methods ----------
+    manager.get_cached_response = MagicMock(return_value=None)
+    manager.save_to_cache = MagicMock()
+
+    # ---------- ASYNCHRONOUS methods ----------
     manager.load_user_data = AsyncMock(return_value={"history": []})
-    # add other methods as needed
+    manager.get_user_model_priority = AsyncMock(return_value=None)
+    manager.get_preferences = AsyncMock(return_value={})
+    manager.get_custom_instructions = AsyncMock(return_value="")
+    manager.get_response_mode = AsyncMock(return_value="text")
+    manager.get_response_style = AsyncMock(return_value="balanced")
+    manager.get_preferred_style = AsyncMock(return_value="no_style")
+    manager.get_voice_speed = AsyncMock(return_value=1.0)
+    manager.get_voice_style = AsyncMock(return_value="neutral")
+    manager.save_model_priority = AsyncMock(return_value=True)
+    manager.save_image_generation_priority = AsyncMock(return_value=True)
+    manager.add_message_to_history = AsyncMock()
+    manager.add_image_to_history = AsyncMock()
+    manager.add_voice_to_history = AsyncMock()
+    manager.search_history = AsyncMock(return_value=[])
+    # Add any other async methods used in tests
+
     return manager
 
 

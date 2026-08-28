@@ -118,7 +118,7 @@ class TextEngine:
 
         # Check cache
         if not skip_cache and user_id is not None:
-            cached = await self.user_data_manager.get_cached_response(input_data)
+            cached = self.user_data_manager.get_cached_response(input_data)
             if cached:
                 response, cached_category, timestamp = cached
                 if response and len(response.strip()) > 5 and not response.startswith(("🌐", "❌", "⚠️")):

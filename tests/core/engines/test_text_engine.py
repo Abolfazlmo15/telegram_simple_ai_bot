@@ -65,7 +65,8 @@ async def test_process_cache_hit(text_engine, mock_user_data_manager):
     user_text = "test prompt"
     cached_response = ("cached answer", "cached_category", 12345)
 
-    mock_user_data_manager.get_cached_response = AsyncMock(return_value=cached_response)
+    # Use MagicMock (synchronous) instead of AsyncMock
+    mock_user_data_manager.get_cached_response = MagicMock(return_value=cached_response)
 
     result, model, tokens = await text_engine.process(
         user_text,
@@ -77,12 +78,12 @@ async def test_process_cache_hit(text_engine, mock_user_data_manager):
     assert tokens == 0
     mock_user_data_manager.get_cached_response.assert_called_once_with(user_text)
 
-
 @pytest.mark.asyncio
 async def test_process_api_call_success(text_engine, mock_user_data_manager):
     """Test successful API call."""
     user_text = "Hello, world!"
-    mock_user_data_manager.get_cached_response = AsyncMock(return_value=None)
+    # Use MagicMock (synchronous) for no cache hit
+    mock_user_data_manager.get_cached_response = MagicMock(return_value=None)
 
     text_engine._execute_model_search = AsyncMock(return_value=("AI response", "test/model", 100))
 
@@ -95,7 +96,6 @@ async def test_process_api_call_success(text_engine, mock_user_data_manager):
     assert model == "test/model"
     assert tokens == 100
     mock_user_data_manager.save_to_cache.assert_called_once_with(user_text, "AI response", "casual_conversation")
-
 
 @pytest.mark.asyncio
 async def test_process_all_models_fail_no_restart(text_engine):
