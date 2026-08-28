@@ -711,6 +711,7 @@ class MessageHandlers:
     async def _process_document(self, update, user_id, username, file_bytes, file_extension,
                                 caption, placeholder, keyboard):
         """Process the document with the DocumentEngine."""
+
         async def status_callback(msg: str, edit: bool = True):
             if edit:
                 try:
@@ -720,7 +721,6 @@ class MessageHandlers:
 
         start_time = time.time()
         try:
-            # Build context for the document engine
             doc_context = {
                 'user_id': user_id,
                 'username': username,
@@ -739,9 +739,11 @@ class MessageHandlers:
             response_time = time.time() - start_time
             logger.info(f"📄 Document processed using {model_used} (tokens: {metadata})")
 
-            # If response is very long, send it as a text file instead of a message
+            # Use MarkdownStripper for fallback
+            from core.utils.markdown_stripper import MarkdownStripper
+            stripper = MarkdownStripper()
+
             if len(response) > Config.DOCUMENT_MAX_TEXT_REPLY_CHARS:
-                # Send as .txt file
                 from telegram import InputFile
                 import io
                 txt_bytes = response.encode('utf-8')
@@ -749,7 +751,6 @@ class MessageHandlers:
                 txt_io.name = "document_content.txt"
                 await placeholder.delete()
                 self._active_tasks.pop((user_id, placeholder.message_id), None)
-
                 await update.message.reply_document(
                     document=InputFile(txt_io, filename="document_content.txt"),
                     caption="📄 *Extracted content (too long for inline)*",
@@ -757,13 +758,16 @@ class MessageHandlers:
                     reply_to_message_id=update.message.message_id
                 )
             else:
-                # Send as normal text
                 formatted = self.formatter.format_response(response)
-                await placeholder.edit_text(formatted, parse_mode=Config.TELEGRAM_PARSE_MODE, reply_markup=None)
+                try:
+                    await placeholder.edit_text(formatted, parse_mode=Config.TELEGRAM_PARSE_MODE, reply_markup=None)
+                except Exception as e:
+                    # Fallback to plain text if Markdown fails
+                    logger.warning(f"Markdown parsing failed: {e}. Sending plain text.")
+                    plain_text = stripper.strip(response, remove_emojis=False)
+                    await placeholder.edit_text(plain_text, parse_mode=None, reply_markup=None)
                 self._active_tasks.pop((user_id, placeholder.message_id), None)
 
-            # Save to history (optional – we can add a dedicated method if needed)
-            # For now, we'll just log it; you may extend UserDataManager later.
             logger.info(f"📄 Document response sent for user {user_id} in {response_time:.2f}s")
 
         except asyncio.CancelledError:
